@@ -294,9 +294,6 @@ impl<'a> XPathContext<'a> {
     /// Returns [`XPathError`] if evaluation fails (e.g., undefined variable,
     /// unknown function, type mismatch).
     pub fn evaluate(&self, expr: &Expr) -> Result<XPathValue, XPathError> {
-        if self.strict_names {
-            self.check_prefixes(expr)?;
-        }
         self.eval_expr(expr)
     }
 
@@ -310,49 +307,22 @@ impl<'a> XPathContext<'a> {
         }
     }
 
-    /// In strict mode, a name test whose prefix has no binding is an error.
-    /// Checked before evaluation, so it doesn't depend on which steps a
-    /// particular document happens to reach.
-    fn check_prefixes(&self, expr: &Expr) -> Result<(), XPathError> {
-        let check_steps = |steps: &[Step]| -> Result<(), XPathError> {
-            for step in steps {
-                let prefix = match &step.node_test {
-                    NodeTest::Name(name) => name.split_once(':').map(|(p, _)| p),
-                    NodeTest::PrefixWildcard(prefix) => Some(prefix.as_str()),
-                    _ => None,
-                };
-                if let Some(prefix) = prefix {
-                    if self.resolve_prefix(prefix).is_none() {
-                        return Err(XPathError::UndefinedNamespacePrefix {
-                            prefix: prefix.to_owned(),
-                        });
-                    }
-                }
-                for predicate in &step.predicates {
-                    self.check_prefixes(predicate)?;
-                }
-            }
-            Ok(())
+    /// In strict mode, a name test whose prefix has no binding is an error,
+    /// raised when the step is applied, as libxml2 does: a step that is
+    /// never reached (`false() and x:y`) can't fail.
+    fn check_step_prefix(&self, step: &Step) -> Result<(), XPathError> {
+        let prefix = match &step.node_test {
+            NodeTest::Name(name) => name.split_once(':').map(|(p, _)| p),
+            NodeTest::PrefixWildcard(prefix) => Some(prefix.as_str()),
+            _ => None,
         };
-        match expr {
-            Expr::Number(_) | Expr::String(_) | Expr::Variable(_) => Ok(()),
-            Expr::BinaryOp { left, right, .. } | Expr::Union(left, right) => {
-                self.check_prefixes(left)?;
-                self.check_prefixes(right)
+        match prefix {
+            Some(prefix) if self.strict_names && self.resolve_prefix(prefix).is_none() => {
+                Err(XPathError::UndefinedNamespacePrefix {
+                    prefix: prefix.to_owned(),
+                })
             }
-            Expr::UnaryNeg(inner) => self.check_prefixes(inner),
-            Expr::FunctionCall { args, .. } => {
-                args.iter().try_for_each(|arg| self.check_prefixes(arg))
-            }
-            Expr::Path { steps } | Expr::RootPath { steps } => check_steps(steps),
-            Expr::Filter { expr, predicates } => {
-                self.check_prefixes(expr)?;
-                predicates.iter().try_for_each(|p| self.check_prefixes(p))
-            }
-            Expr::FilterPath { expr, steps } => {
-                self.check_prefixes(expr)?;
-                check_steps(steps)
-            }
+            _ => Ok(()),
         }
     }
 
@@ -583,6 +553,7 @@ impl<'a> XPathContext<'a> {
     /// Applies a single step to every node in `input`, producing a new node
     /// set in document order with duplicates removed.
     fn apply_step(&self, input: &[XPathNode], step: &Step) -> Result<Vec<XPathNode>, XPathError> {
+        self.check_step_prefix(step)?;
         let mut result: Vec<XPathNode> = Vec::new();
 
         if step.predicates.is_empty() {
@@ -3509,11 +3480,25 @@ mod tests {
         assert_eq!(count_strict(xml, "//nope:item", &[]), unbound);
         assert_eq!(count_strict(xml, "//nope:*", &[]), unbound);
         assert_eq!(count_strict(xml, "/root[nope:x]", &[]), unbound);
+        // Raised when the step is applied, even to an empty node-set...
+        assert_eq!(count_strict(xml, "/missing/nope:x", &[]), unbound);
         // The xml prefix is always bound.
         assert_eq!(
             count_strict(r#"<r xml:lang="en"/>"#, "/r/@xml:lang", &[]),
             Ok(1)
         );
+    }
+
+    #[test]
+    fn test_strict_unbound_prefix_in_unevaluated_branch_is_not_an_error() {
+        // ...but not when the step is never reached, as in libxml2.
+        let doc = Document::parse_str("<root/>").unwrap();
+        let mut ctx = XPathContext::new(&doc, doc.root());
+        ctx.set_strict_names(true);
+        let result = ctx.evaluate(&parse("false() and nope:x").unwrap());
+        assert_eq!(result, Ok(XPathValue::Boolean(false)));
+        let result = ctx.evaluate(&parse("count(/root[false() and nope:x])").unwrap());
+        assert_eq!(result, Ok(XPathValue::Number(0.0)));
     }
 
     #[test]
