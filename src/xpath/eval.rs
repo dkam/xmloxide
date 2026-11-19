@@ -297,6 +297,20 @@ impl<'a> XPathContext<'a> {
         self.eval_expr(expr)
     }
 
+    /// Sorts nodes into document order; attribute nodes sort just after
+    /// their owner element, by attribute index. Ids are document order until
+    /// the tree has been rearranged; then the document supplies positions.
+    fn sort_document_order(&self, nodes: &mut [XPathNode]) {
+        if self.doc.ids_in_document_order() {
+            nodes.sort_unstable();
+        } else {
+            nodes.sort_unstable_by_key(|node| {
+                let (anchor, is_attribute, index) = node.sort_key();
+                (self.doc.document_order_key(anchor), is_attribute, index)
+            });
+        }
+    }
+
     /// The namespace URI `prefix` is bound to: a registered binding, or the
     /// built-in `xml` prefix.
     fn resolve_prefix(&self, prefix: &str) -> Option<&str> {
@@ -542,7 +556,7 @@ impl<'a> XPathContext<'a> {
             }
             result.extend(group);
         }
-        sort_document_order(&mut result);
+        self.sort_document_order(&mut result);
         Ok(result)
     }
 
@@ -614,7 +628,7 @@ impl<'a> XPathContext<'a> {
         );
         let attribute_input = input.len() > 1 && input.iter().any(|n| n.is_attribute());
         if needs_sort || attribute_input {
-            sort_document_order(&mut result);
+            self.sort_document_order(&mut result);
         }
 
         Ok(result)
@@ -1332,7 +1346,7 @@ impl<'a> XPathContext<'a> {
                 lnodes.push(id);
             }
         }
-        sort_document_order(&mut lnodes);
+        self.sort_document_order(&mut lnodes);
 
         Ok(XPathValue::NodeSet(lnodes))
     }
@@ -1872,7 +1886,7 @@ impl<'a> XPathContext<'a> {
             }
         }
 
-        sort_document_order(&mut result);
+        self.sort_document_order(&mut result);
         Ok(XPathValue::NodeSet(result))
     }
 
@@ -2316,15 +2330,6 @@ impl<'a> XPathContext<'a> {
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Sorts a node-set into document order using the arena index as a proxy.
-///
-/// Since nodes are allocated in document order during parsing, the arena
-/// index (encoded in `NodeId`) directly reflects document order; attribute
-/// nodes sort just after their owner element, by attribute index.
-fn sort_document_order(nodes: &mut [XPathNode]) {
-    nodes.sort_unstable();
-}
 
 /// Rounds a number using `XPath` rounding rules: round half toward positive
 /// infinity.
@@ -3596,5 +3601,24 @@ mod tests {
         assert_eq!(strings("/descendant::i[1]"), ["1"]);
         assert_eq!(strings("(//i)[last()]"), ["4"]);
         assert_eq!(strings("//i[. > 1]"), ["2", "3", "4"]);
+    }
+
+    #[test]
+    fn test_results_follow_document_order_after_insertion() {
+        let mut doc = Document::parse_str("<r><a/><b/></r>").unwrap();
+        let r = doc.root_element().unwrap();
+        let a = doc.first_child(r).unwrap();
+        let first = doc.create_element("b");
+        doc.insert_before(a, first);
+        let ctx = XPathContext::new(&doc, doc.root());
+        let names = |xpath: &str| -> Vec<NodeId> {
+            match ctx.evaluate(&parse(xpath).unwrap()).unwrap() {
+                XPathValue::NodeSet(nodes) => nodes.into_iter().map(XPathNode::anchor).collect(),
+                other => panic!("expected node-set, got {other:?}"),
+            }
+        };
+        let last_b = doc.last_child(r).unwrap();
+        assert_eq!(names("//a | //b"), [first, a, last_b]);
+        assert_eq!(names("/r/*[2]"), [a]);
     }
 }

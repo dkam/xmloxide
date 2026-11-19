@@ -169,6 +169,17 @@ pub struct Document {
     /// `AtomicBool::get_mut`, a plain non-atomic load, so the parsers' hot
     /// mutation path doesn't pay for an acquire load on every node.
     id_attr_index_built: AtomicBool,
+    /// Whether `NodeId` order is document order. True for a new document,
+    /// kept true by appends that add a new leaf at the end of the document
+    /// (which is how the XML parser builds), and cleared by any other
+    /// insertion. See [`document_order_key`](Document::document_order_key).
+    ids_in_order: bool,
+    /// The last node of the document in document order, while
+    /// `ids_in_order` holds.
+    tail: NodeId,
+    /// Every node's position in document order, computed on demand once
+    /// `ids_in_order` no longer holds. Discarded by every link change.
+    positions: OnceLock<Vec<u32>>,
 }
 
 impl Document {
@@ -199,6 +210,9 @@ impl Document {
             id_map: HashMap::new(),
             id_attr_index: OnceLock::new(),
             id_attr_index_built: AtomicBool::new(false),
+            ids_in_order: true,
+            tail: root,
+            positions: OnceLock::new(),
         }
     }
 
@@ -433,6 +447,78 @@ impl Document {
     fn invalidate_id_attr_index(&mut self) {
         self.id_attr_index = OnceLock::new();
         *self.id_attr_index_built.get_mut() = false;
+    }
+
+    /// Returns a key that sorts nodes into document order.
+    ///
+    /// Nodes of the same tree compare in document order. Each detached
+    /// subtree gets a range of its own, so nodes of different trees still
+    /// compare consistently. While nodes have only been appended in order,
+    /// as by the XML parser, the key is the node's id; once the tree has been
+    /// rearranged, keys come from a walk of the arena that is cached until
+    /// the next change.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is out of bounds.
+    #[must_use]
+    pub fn document_order_key(&self, id: NodeId) -> u32 {
+        if self.ids_in_order {
+            return id.into_raw();
+        }
+        self.positions.get_or_init(|| self.compute_positions())[id.as_index()]
+    }
+
+    /// Whether `NodeId` order is currently document order, so that sorting
+    /// by id sorts into document order.
+    #[must_use]
+    pub fn ids_in_document_order(&self) -> bool {
+        self.ids_in_order
+    }
+
+    /// Each node's position in document order: the document first, then
+    /// each detached subtree, every tree walked in pre-order.
+    #[allow(clippy::cast_possible_truncation)] // node counts fit in u32 (NodeId)
+    fn compute_positions(&self) -> Vec<u32> {
+        let mut positions = vec![0; self.nodes.len()];
+        let mut next: u32 = 0;
+        for index in 1..self.nodes.len() {
+            if self.nodes[index].parent.is_some() {
+                continue;
+            }
+            let tree = NodeId::from_index(index);
+            for id in std::iter::once(tree).chain(self.descendants(tree)) {
+                positions[id.as_index()] = next;
+                next += 1;
+            }
+        }
+        positions
+    }
+
+    /// Records that the tree's links changed: cached positions are stale.
+    fn links_changed(&mut self) {
+        self.positions = OnceLock::new();
+    }
+
+    /// Whether `ancestor` is `node` or one of its ancestors.
+    fn is_ancestor_or_self(&self, ancestor: NodeId, node: NodeId) -> bool {
+        let mut current = Some(node);
+        while let Some(id) = current {
+            if id == ancestor {
+                return true;
+            }
+            current = self.node(id).parent;
+        }
+        false
+    }
+
+    /// The last node of `id`'s subtree in document order.
+    fn last_descendant_or_self(&self, id: NodeId) -> NodeId {
+        let mut current = id;
+        while let Some(last) = self.node(current).last_child {
+            current = last;
+        }
+        current
     }
 
     /// Returns `true` if the node is an element.
@@ -736,6 +822,18 @@ impl Document {
             "child already has a parent; detach it first"
         );
 
+        // Ids stay in document order if a new leaf is appended at the end of
+        // the document: to the last node or one of its ancestors.
+        if self.ids_in_order {
+            let newest_leaf =
+                child.as_index() == self.nodes.len() - 1 && self.node(child).first_child.is_none();
+            if newest_leaf && self.is_ancestor_or_self(parent, self.tail) {
+                self.tail = child;
+            } else {
+                self.ids_in_order = false;
+            }
+        }
+        self.links_changed();
         self.node_mut(child).parent = Some(parent);
 
         if let Some(last) = self.node(parent).last_child {
@@ -768,6 +866,8 @@ impl Document {
             .node(reference)
             .parent
             .expect("reference has no parent");
+        self.ids_in_order = false;
+        self.links_changed();
         self.node_mut(new_child).parent = Some(parent);
 
         if let Some(prev) = self.node(reference).prev_sibling {
@@ -815,6 +915,13 @@ impl Document {
 
         let prev = self.node(id).prev_sibling;
         let next = self.node(id).next_sibling;
+
+        // Removing a subtree keeps the rest in order; if it held the last
+        // node, the last node is now whatever preceded the subtree.
+        if self.ids_in_order && self.is_ancestor_or_self(id, self.tail) {
+            self.tail = prev.map_or(parent, |p| self.last_descendant_or_self(p));
+        }
+        self.links_changed();
 
         match prev {
             Some(p) => self.node_mut(p).next_sibling = next,
@@ -977,6 +1084,8 @@ impl Document {
             .node(reference)
             .parent
             .expect("reference has no parent");
+        self.ids_in_order = false;
+        self.links_changed();
         self.node_mut(new_child).parent = Some(parent);
 
         if let Some(next) = self.node(reference).next_sibling {
@@ -2444,5 +2553,80 @@ mod tests {
         let mut doc = Document::new();
         let text = doc.create_text("hello");
         assert!(!doc.rename_element(text, "span"));
+    }
+
+    // -- Document order ------------------------------------------------------
+
+    /// The nodes of `doc`'s tree in document order, sorted by their keys.
+    fn sorted_by_key(doc: &Document) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = doc.descendants(doc.root()).collect();
+        nodes.sort_by_key(|&id| doc.document_order_key(id));
+        nodes
+    }
+
+    #[test]
+    fn test_parsed_document_keeps_ids_in_order() {
+        let xml =
+            "<?xml version='1.0'?><!--c--><r a='1'><x>t<y/>u</x><?pi d?><z><![CDATA[c]]></z></r>";
+        let doc = Document::parse_str(xml).unwrap();
+        assert!(doc.ids_in_document_order());
+        let walk: Vec<NodeId> = doc.descendants(doc.root()).collect();
+        assert_eq!(sorted_by_key(&doc), walk);
+    }
+
+    #[test]
+    fn test_insertion_keeps_document_order_keys_correct() {
+        let mut doc = Document::parse_str("<r><a/><b/></r>").unwrap();
+        let root = doc.root_element().unwrap();
+        let first = doc.first_child(root).unwrap();
+        let inserted = doc.create_element("c");
+        doc.insert_before(first, inserted);
+        assert!(!doc.ids_in_document_order());
+        let walk: Vec<NodeId> = doc.descendants(doc.root()).collect();
+        assert_eq!(sorted_by_key(&doc), walk);
+        assert!(doc.document_order_key(inserted) < doc.document_order_key(first));
+
+        // Cached keys are discarded when the tree changes again.
+        let last = doc.last_child(root).unwrap();
+        doc.detach(inserted);
+        doc.insert_after(last, inserted);
+        assert!(doc.document_order_key(last) < doc.document_order_key(inserted));
+    }
+
+    #[test]
+    fn test_detach_and_append_at_end_keep_ids_in_order() {
+        let mut doc = Document::parse_str("<r><a><x/></a><b><y/></b></r>").unwrap();
+        let root = doc.root_element().unwrap();
+        let last = doc.last_child(root).unwrap();
+        doc.detach(last);
+        assert!(doc.ids_in_document_order());
+        let appended = doc.create_element("c");
+        doc.append_child(root, appended);
+        assert!(doc.ids_in_document_order());
+        let walk: Vec<NodeId> = doc.descendants(doc.root()).collect();
+        assert_eq!(sorted_by_key(&doc), walk);
+
+        // Appending anywhere but the end gives up on id order.
+        let first = doc.first_child(root).unwrap();
+        let nested = doc.create_element("d");
+        doc.append_child(first, nested);
+        assert!(!doc.ids_in_document_order());
+        let walk: Vec<NodeId> = doc.descendants(doc.root()).collect();
+        assert_eq!(sorted_by_key(&doc), walk);
+    }
+
+    #[test]
+    fn test_detached_subtrees_get_their_own_range() {
+        let mut doc = Document::parse_str("<r><a><x/></a><b/></r>").unwrap();
+        let root = doc.root_element().unwrap();
+        let detached = doc.first_child(root).unwrap();
+        let inner = doc.first_child(detached).unwrap();
+        doc.detach(detached);
+        let remaining = doc.first_child(root).unwrap();
+        let fresh = doc.create_element("f");
+        doc.insert_before(remaining, fresh);
+        // Within each tree, keys follow document order.
+        assert!(doc.document_order_key(fresh) < doc.document_order_key(remaining));
+        assert!(doc.document_order_key(detached) < doc.document_order_key(inner));
     }
 }

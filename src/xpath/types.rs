@@ -72,7 +72,7 @@ impl XPathNode {
     ///
     /// Relies on the arena property that `NodeId`s of a parsed document are
     /// allocated in document order.
-    fn sort_key(self) -> (NodeId, u8, u32) {
+    pub(crate) fn sort_key(self) -> (NodeId, u8, u32) {
         match self {
             Self::Node(id) => (id, 0, 0),
             Self::Attribute { owner, index } => (owner, 1, index),
