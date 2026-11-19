@@ -24,6 +24,10 @@ pub struct SerializeOptions {
     /// The indentation string used for each level when `indent` is `true`.
     /// Defaults to two spaces.
     pub indent_str: String,
+    /// Whether serializing a whole document emits the `<?xml ...?>`
+    /// declaration. Defaults to `true` (libxml2's behaviour without
+    /// `XML_SAVE_NO_DECL`).
+    pub xml_declaration: bool,
 }
 
 impl Default for SerializeOptions {
@@ -31,6 +35,7 @@ impl Default for SerializeOptions {
         Self {
             indent: false,
             indent_str: "  ".to_string(),
+            xml_declaration: true,
         }
     }
 }
@@ -57,6 +62,14 @@ impl SerializeOptions {
     #[must_use]
     pub fn indent_str(mut self, s: &str) -> Self {
         self.indent_str = s.to_string();
+        self
+    }
+
+    /// Enables or disables the XML declaration when serializing a whole
+    /// document. Enabled by default.
+    #[must_use]
+    pub fn xml_declaration(mut self, yes: bool) -> Self {
+        self.xml_declaration = yes;
         self
     }
 }
@@ -97,22 +110,24 @@ pub fn serialize(doc: &Document) -> String {
 pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> String {
     let mut output = String::new();
 
-    // XML declaration — always emit, defaulting to version 1.0 (matches libxml2)
-    let version = doc.version.as_deref().unwrap_or("1.0");
-    output.push_str("<?xml version=\"");
-    output.push_str(version);
-    output.push('"');
-    if let Some(ref encoding) = doc.encoding {
-        output.push_str(" encoding=\"");
-        output.push_str(encoding);
+    // XML declaration — emitted by default, defaulting to version 1.0 (matches libxml2)
+    if options.xml_declaration {
+        let version = doc.version.as_deref().unwrap_or("1.0");
+        output.push_str("<?xml version=\"");
+        output.push_str(version);
         output.push('"');
+        if let Some(ref encoding) = doc.encoding {
+            output.push_str(" encoding=\"");
+            output.push_str(encoding);
+            output.push('"');
+        }
+        if let Some(standalone) = doc.standalone {
+            output.push_str(" standalone=\"");
+            output.push_str(if standalone { "yes" } else { "no" });
+            output.push('"');
+        }
+        output.push_str("?>\n");
     }
-    if let Some(standalone) = doc.standalone {
-        output.push_str(" standalone=\"");
-        output.push_str(if standalone { "yes" } else { "no" });
-        output.push('"');
-    }
-    output.push_str("?>\n");
 
     // When no encoding is declared, non-ASCII chars in attributes are
     // re-encoded as hex character references (matches libxml2 behavior).
@@ -120,7 +135,7 @@ pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> Str
 
     // Serialize children of the document root
     for child in doc.children(doc.root()) {
-        serialize_node(
+        write_node(
             doc,
             child,
             &mut output,
@@ -134,6 +149,41 @@ pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> Str
     // Trailing newline (matches libxml2 output convention)
     output.push('\n');
 
+    output
+}
+
+/// Serializes a single node and its subtree to an XML string.
+///
+/// For the document node this is [`serialize_with_options`]. For any other
+/// node it is the node's markup alone: no XML declaration and no trailing
+/// newline, matching libxml2's `xmlSaveTree` on a node.
+///
+/// # Examples
+///
+/// ```
+/// use xmloxide::Document;
+/// use xmloxide::serial::{serialize_node, SerializeOptions};
+///
+/// let doc = Document::parse_str("<root><child a=\"1\">Hi</child></root>").unwrap();
+/// let root = doc.root_element().unwrap();
+/// let child = doc.first_child(root).unwrap();
+/// assert_eq!(serialize_node(&doc, child, &SerializeOptions::default()), "<child a=\"1\">Hi</child>");
+/// ```
+#[must_use]
+pub fn serialize_node(doc: &Document, id: NodeId, options: &SerializeOptions) -> String {
+    if id == doc.root() {
+        return serialize_with_options(doc, options);
+    }
+    let mut output = String::new();
+    write_node(
+        doc,
+        id,
+        &mut output,
+        doc.encoding.is_none(),
+        options,
+        0,
+        false,
+    );
     output
 }
 
@@ -155,7 +205,7 @@ fn is_element_only(doc: &Document, id: NodeId) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-fn serialize_node(
+fn write_node(
     doc: &Document,
     id: NodeId,
     out: &mut String,
@@ -220,7 +270,7 @@ fn serialize_node(
                             }
                         }
                     }
-                    serialize_node(
+                    write_node(
                         doc,
                         child,
                         out,
