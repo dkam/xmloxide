@@ -182,6 +182,28 @@ pub struct Document {
     positions: OnceLock<Vec<u32>>,
 }
 
+impl Clone for Document {
+    /// Copies the whole document. The copy starts without the `id` attribute
+    /// index, and builds its own on its first
+    /// [`element_by_id`](Document::element_by_id) lookup.
+    fn clone(&self) -> Self {
+        Self {
+            nodes: self.nodes.clone(),
+            root: self.root,
+            version: self.version.clone(),
+            encoding: self.encoding.clone(),
+            standalone: self.standalone,
+            diagnostics: self.diagnostics.clone(),
+            id_map: self.id_map.clone(),
+            id_attr_index: OnceLock::new(),
+            id_attr_index_built: AtomicBool::new(false),
+            ids_in_order: self.ids_in_order,
+            tail: self.tail,
+            positions: self.positions.clone(),
+        }
+    }
+}
+
 impl Document {
     /// Creates a new empty document.
     ///
@@ -447,6 +469,23 @@ impl Document {
     fn invalidate_id_attr_index(&mut self) {
         self.id_attr_index = OnceLock::new();
         *self.id_attr_index_built.get_mut() = false;
+    }
+
+    /// Returns a mutable reference to a node's kind, to change its name,
+    /// namespace, attributes, or content in place.
+    ///
+    /// The tree's links can't be changed this way; use
+    /// [`append_child`](Self::append_child), [`detach`](Self::detach), and
+    /// the other tree operations for that. Like every mutation, it discards
+    /// the index of `id` attributes that
+    /// [`element_by_id`](Self::element_by_id) builds, but it doesn't change
+    /// IDs registered with [`set_id`](Self::set_id).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` is out of bounds.
+    pub fn kind_mut(&mut self, id: NodeId) -> &mut NodeKind {
+        &mut self.node_mut(id).kind
     }
 
     /// Returns a key that sorts nodes into document order.
@@ -966,6 +1005,36 @@ impl Document {
             }
         }
         new_id
+    }
+
+    /// Deep-copies a node and its descendants from another document into
+    /// this one, like the DOM's `importNode`.
+    ///
+    /// The copy is detached; attach it with [`append_child`](Self::append_child)
+    /// or another tree operation. It has the same shape as the original, so
+    /// walking both subtrees in document order pairs each node with its copy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use xmloxide::Document;
+    ///
+    /// let source = Document::parse_str("<a><b>hi</b></a>").unwrap();
+    /// let mut target = Document::parse_str("<root/>").unwrap();
+    /// let b = source.first_child(source.root_element().unwrap()).unwrap();
+    /// let copy = target.import_node(&source, b);
+    /// let root = target.root_element().unwrap();
+    /// target.append_child(root, copy);
+    /// assert_eq!(target.text_content(root), "hi");
+    /// ```
+    pub fn import_node(&mut self, source: &Document, id: NodeId) -> NodeId {
+        let copy = self.create_node(source.node(id).kind.clone());
+        let children: Vec<NodeId> = source.children(id).collect();
+        for child in children {
+            let child_copy = self.import_node(source, child);
+            self.append_child(copy, child_copy);
+        }
+        copy
     }
 
     /// Sets the text content of a text, CDATA, or comment node.
@@ -2628,5 +2697,73 @@ mod tests {
         // Within each tree, keys follow document order.
         assert!(doc.document_order_key(fresh) < doc.document_order_key(remaining));
         assert!(doc.document_order_key(detached) < doc.document_order_key(inner));
+    }
+
+    #[test]
+    fn test_import_node_copies_across_documents() {
+        let source = Document::parse_str("<a><b k='v'>hi<c/></b></a>").unwrap();
+        let mut target = Document::parse_str("<root/>").unwrap();
+        let b = source.first_child(source.root_element().unwrap()).unwrap();
+        let copy = target.import_node(&source, b);
+        assert_eq!(target.parent(copy), None);
+        let root = target.root_element().unwrap();
+        target.append_child(root, copy);
+        assert_eq!(target.attribute(copy, "k"), Some("v"));
+        let original: Vec<Option<&str>> =
+            source.descendants(b).map(|n| source.node_name(n)).collect();
+        let copied: Vec<Option<&str>> = target
+            .descendants(copy)
+            .map(|n| target.node_name(n))
+            .collect();
+        assert_eq!(original, copied);
+    }
+
+    #[test]
+    fn test_clone_is_independent() {
+        let doc = Document::parse_str("<r><a/></r>").unwrap();
+        let mut copy = doc.clone();
+        let r = copy.root_element().unwrap();
+        let a = copy.first_child(r).unwrap();
+        copy.detach(a);
+        assert_eq!(copy.first_child(r), None);
+        assert!(doc.first_child(doc.root_element().unwrap()).is_some());
+    }
+
+    #[test]
+    fn test_clone_builds_its_own_id_index() {
+        let doc = Document::parse_str(r#"<r><a id="x"/><b/></r>"#).unwrap();
+        let a = doc.element_by_id("x").unwrap();
+        let mut copy = doc.clone();
+        let b = copy.next_sibling(a).unwrap();
+        copy.remove_attribute(a, "id");
+        copy.set_attribute(b, "id", "x");
+        assert_eq!(copy.element_by_id("x"), Some(b));
+        assert_eq!(doc.element_by_id("x"), Some(a));
+    }
+
+    #[test]
+    fn test_kind_mut_discards_the_id_index() {
+        let mut doc = Document::parse_str(r#"<r><a id="x"/></r>"#).unwrap();
+        let a = doc.element_by_id("x").unwrap();
+        if let NodeKind::Element { attributes, .. } = doc.kind_mut(a) {
+            attributes[0].value = "y".to_owned();
+        }
+        assert_eq!(doc.element_by_id("x"), None);
+        assert_eq!(doc.element_by_id("y"), Some(a));
+    }
+
+    #[test]
+    fn test_kind_mut_changes_a_node_in_place() {
+        let mut doc = Document::parse_str("<r/>").unwrap();
+        let r = doc.root_element().unwrap();
+        if let NodeKind::Element {
+            name, namespace, ..
+        } = doc.kind_mut(r)
+        {
+            *name = "s".to_owned();
+            *namespace = Some("urn:s".to_owned());
+        }
+        assert_eq!(doc.node_name(r), Some("s"));
+        assert_eq!(doc.node_namespace(r), Some("urn:s"));
     }
 }
