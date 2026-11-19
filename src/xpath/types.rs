@@ -405,6 +405,13 @@ pub enum XPathError {
         name: String,
     },
 
+    /// A name used a namespace prefix that has no binding in the context
+    /// (only in strict mode; see `XPathContext::set_strict_names`).
+    UndefinedNamespacePrefix {
+        /// The unbound prefix.
+        prefix: String,
+    },
+
     /// A function was called with the wrong number of arguments.
     InvalidArgCount {
         /// The name of the function.
@@ -439,6 +446,9 @@ impl fmt::Display for XPathError {
             }
             Self::UndefinedFunction { name } => {
                 write!(f, "undefined function: {name}()")
+            }
+            Self::UndefinedNamespacePrefix { prefix } => {
+                write!(f, "undefined namespace prefix: {prefix}")
             }
             Self::InvalidArgCount {
                 function,

@@ -20,13 +20,138 @@
 //! # Functions
 //!
 //! All 27 core `XPath` 1.0 functions are implemented (node-set, string,
-//! boolean, and number function groups).
+//! boolean, and number function groups). A host application can add its own
+//! through [`FunctionResolver`].
 
 use std::collections::{HashMap, HashSet};
 
 use super::ast::{Axis, BinaryOp, Expr, NodeTest, Step};
 use super::types::{XPathError, XPathNode};
 use crate::tree::{Attribute, Document, NodeId, NodeKind};
+
+/// The XML namespace, which the `xml` prefix is always bound to.
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+
+/// Functions supplied by the host application, beyond the built-in library.
+///
+/// The evaluator consults the resolver for any function name that isn't
+/// built in, after resolving a prefixed name (`ext:fn`) to its namespace URI
+/// through the context's namespace bindings. Arguments are evaluated only if
+/// the resolver asks for them, through [`ExtensionCall::args`].
+///
+/// ```
+/// use xmloxide::Document;
+/// use xmloxide::xpath::eval::{ExtensionCall, FunctionResolver, XPathContext};
+/// use xmloxide::xpath::parser::parse;
+/// use xmloxide::xpath::{XPathError, XPathValue};
+///
+/// struct Shout;
+///
+/// impl FunctionResolver for Shout {
+///     fn call(
+///         &self,
+///         name: &str,
+///         namespace: Option<&str>,
+///         call: &ExtensionCall<'_, '_>,
+///     ) -> Option<Result<XPathValue, XPathError>> {
+///         if (name, namespace) != ("shout", Some("urn:example")) {
+///             return None;
+///         }
+///         Some(call.args().map(|args| {
+///             XPathValue::String(call.string(&args[0]).to_uppercase())
+///         }))
+///     }
+/// }
+///
+/// let doc = Document::parse_str("<root>hi</root>").unwrap();
+/// let mut ctx = XPathContext::new(&doc, doc.root());
+/// ctx.set_namespace("ex", "urn:example");
+/// ctx.set_function_resolver(&Shout);
+/// let result = ctx.evaluate(&parse("ex:shout(/root)").unwrap()).unwrap();
+/// assert_eq!(result.to_xpath_string(), "HI");
+/// ```
+pub trait FunctionResolver {
+    /// Calls the function `name` in `namespace` (`None` for an unprefixed
+    /// name). Returns `None` if the resolver has no such function, which
+    /// makes the call an [`XPathError::UndefinedFunction`].
+    fn call(
+        &self,
+        name: &str,
+        namespace: Option<&str>,
+        call: &ExtensionCall<'_, '_>,
+    ) -> Option<Result<XPathValue, XPathError>>;
+}
+
+/// A call to a host-supplied function: its arguments and the evaluation
+/// context it was made in.
+pub struct ExtensionCall<'c, 'a> {
+    context: &'c XPathContext<'a>,
+    args: &'c [Expr],
+}
+
+impl<'a> ExtensionCall<'_, 'a> {
+    /// The number of arguments passed.
+    #[must_use]
+    pub fn arg_count(&self) -> usize {
+        self.args.len()
+    }
+
+    /// Evaluates the arguments, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error any argument's evaluation produces.
+    pub fn args(&self) -> Result<Vec<XPathValue>, XPathError> {
+        self.args
+            .iter()
+            .map(|arg| self.context.eval_expr(arg))
+            .collect()
+    }
+
+    /// The context node the function was called at.
+    #[must_use]
+    pub fn context_node(&self) -> XPathNode {
+        self.context.context_node
+    }
+
+    /// The context position (1-based).
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.context.context_position
+    }
+
+    /// The context size.
+    #[must_use]
+    pub fn size(&self) -> usize {
+        self.context.context_size
+    }
+
+    /// The document being queried.
+    #[must_use]
+    pub fn document(&self) -> &'a Document {
+        self.context.doc
+    }
+
+    /// Converts `value` to a string as the `string()` function does. Unlike
+    /// [`XPathValue::to_xpath_string`], this gives a node-set the string
+    /// value of its first node.
+    #[must_use]
+    pub fn string(&self, value: &XPathValue) -> String {
+        self.context.value_to_string(value)
+    }
+
+    /// Converts `value` to a number as the `number()` function does.
+    #[must_use]
+    pub fn number(&self, value: &XPathValue) -> f64 {
+        self.context.value_to_number(value)
+    }
+
+    /// The string value of `node`.
+    #[must_use]
+    pub fn string_value(&self, node: XPathNode) -> String {
+        self.context.string_value(node)
+    }
+}
 
 /// Evaluation context for an `XPath` 1.0 expression.
 ///
@@ -66,6 +191,11 @@ pub struct XPathContext<'a> {
     /// the prefix to a URI and comparing against the element's namespace URI
     /// and local name.
     namespaces: HashMap<String, String>,
+    /// Resolve names exactly as `XPath` 1.0 section 2.3 specifies; see
+    /// [`set_strict_names`](Self::set_strict_names).
+    strict_names: bool,
+    /// Host-supplied functions, consulted for names that aren't built in.
+    functions: Option<&'a dyn FunctionResolver>,
 }
 
 /// An `XPath` 1.0 value.
@@ -100,6 +230,8 @@ impl<'a> XPathContext<'a> {
             context_size: 1,
             variables: HashMap::new(),
             namespaces: HashMap::new(),
+            strict_names: false,
+            functions: None,
         }
     }
 
@@ -121,6 +253,27 @@ impl<'a> XPathContext<'a> {
         self.namespaces.insert(prefix.to_owned(), uri.to_owned());
     }
 
+    /// Resolves name tests exactly as `XPath` 1.0 section 2.3 specifies, as
+    /// libxml2 does:
+    ///
+    /// - an unprefixed name matches only elements and attributes in no
+    ///   namespace, so `//item` doesn't match `<item xmlns="urn:x"/>`;
+    /// - a prefix with no binding (other than the built-in `xml`) is an
+    ///   [`XPathError::UndefinedNamespacePrefix`].
+    ///
+    /// Off by default. Then an unprefixed name matches on local name alone,
+    /// and an unbound prefix is compared literally with the node's prefix,
+    /// which is convenient for documents with a default namespace.
+    pub fn set_strict_names(&mut self, strict: bool) {
+        self.strict_names = strict;
+    }
+
+    /// Supplies functions beyond the built-in library. See
+    /// [`FunctionResolver`].
+    pub fn set_function_resolver(&mut self, resolver: &'a dyn FunctionResolver) {
+        self.functions = Some(resolver);
+    }
+
     /// Binds a variable name to a value in this context.
     ///
     /// Variable references in expressions (e.g., `$x`) will resolve to the
@@ -136,7 +289,66 @@ impl<'a> XPathContext<'a> {
     /// Returns [`XPathError`] if evaluation fails (e.g., undefined variable,
     /// unknown function, type mismatch).
     pub fn evaluate(&self, expr: &Expr) -> Result<XPathValue, XPathError> {
+        if self.strict_names {
+            self.check_prefixes(expr)?;
+        }
         self.eval_expr(expr)
+    }
+
+    /// The namespace URI `prefix` is bound to: a registered binding, or the
+    /// built-in `xml` prefix.
+    fn resolve_prefix(&self, prefix: &str) -> Option<&str> {
+        match self.namespaces.get(prefix) {
+            Some(uri) => Some(uri),
+            None if prefix == "xml" => Some(XML_NAMESPACE),
+            None => None,
+        }
+    }
+
+    /// In strict mode, a name test whose prefix has no binding is an error.
+    /// Checked before evaluation, so it doesn't depend on which steps a
+    /// particular document happens to reach.
+    fn check_prefixes(&self, expr: &Expr) -> Result<(), XPathError> {
+        let check_steps = |steps: &[Step]| -> Result<(), XPathError> {
+            for step in steps {
+                let prefix = match &step.node_test {
+                    NodeTest::Name(name) => name.split_once(':').map(|(p, _)| p),
+                    NodeTest::PrefixWildcard(prefix) => Some(prefix.as_str()),
+                    _ => None,
+                };
+                if let Some(prefix) = prefix {
+                    if self.resolve_prefix(prefix).is_none() {
+                        return Err(XPathError::UndefinedNamespacePrefix {
+                            prefix: prefix.to_owned(),
+                        });
+                    }
+                }
+                for predicate in &step.predicates {
+                    self.check_prefixes(predicate)?;
+                }
+            }
+            Ok(())
+        };
+        match expr {
+            Expr::Number(_) | Expr::String(_) | Expr::Variable(_) => Ok(()),
+            Expr::BinaryOp { left, right, .. } | Expr::Union(left, right) => {
+                self.check_prefixes(left)?;
+                self.check_prefixes(right)
+            }
+            Expr::UnaryNeg(inner) => self.check_prefixes(inner),
+            Expr::FunctionCall { args, .. } => {
+                args.iter().try_for_each(|arg| self.check_prefixes(arg))
+            }
+            Expr::Path { steps } | Expr::RootPath { steps } => check_steps(steps),
+            Expr::Filter { expr, predicates } => {
+                self.check_prefixes(expr)?;
+                predicates.iter().try_for_each(|p| self.check_prefixes(p))
+            }
+            Expr::FilterPath { expr, steps } => {
+                self.check_prefixes(expr)?;
+                check_steps(steps)
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -427,19 +639,24 @@ impl<'a> XPathContext<'a> {
         // node_matches_test. This is the hottest path for queries like
         // //entry/title or /root/child.
         //
-        // Only use the fast path when no namespace bindings are registered,
-        // because namespace-aware matching needs the full matches_element_name
-        // logic.
+        // Only use the fast path for unprefixed names, and only when no
+        // namespace bindings are registered or names are strict (an
+        // unprefixed name then means "no namespace", whatever is bound),
+        // because namespace-aware matching needs the full
+        // matches_element_name logic.
         if let NodeTest::Name(name) = test {
-            if self.namespaces.is_empty() {
+            let strict = self.strict_names;
+            if !name.contains(':') && (strict || self.namespaces.is_empty()) {
                 match axis {
                     Axis::Child => {
                         for child in self.doc.children(node) {
                             if let NodeKind::Element {
-                                name: elem_name, ..
+                                name: elem_name,
+                                namespace,
+                                ..
                             } = &self.doc.node(child).kind
                             {
-                                if elem_name == name {
+                                if elem_name == name && (!strict || namespace.is_none()) {
                                     result.push(XPathNode::Node(child));
                                 }
                             }
@@ -449,10 +666,12 @@ impl<'a> XPathContext<'a> {
                     Axis::Descendant => {
                         for desc in self.doc.descendants(node) {
                             if let NodeKind::Element {
-                                name: elem_name, ..
+                                name: elem_name,
+                                namespace,
+                                ..
                             } = &self.doc.node(desc).kind
                             {
-                                if elem_name == name {
+                                if elem_name == name && (!strict || namespace.is_none()) {
                                     result.push(XPathNode::Node(desc));
                                 }
                             }
@@ -461,19 +680,23 @@ impl<'a> XPathContext<'a> {
                     }
                     Axis::DescendantOrSelf => {
                         if let NodeKind::Element {
-                            name: elem_name, ..
+                            name: elem_name,
+                            namespace,
+                            ..
                         } = &self.doc.node(node).kind
                         {
-                            if elem_name == name {
+                            if elem_name == name && (!strict || namespace.is_none()) {
                                 result.push(XPathNode::Node(node));
                             }
                         }
                         for desc in self.doc.descendants(node) {
                             if let NodeKind::Element {
-                                name: elem_name, ..
+                                name: elem_name,
+                                namespace,
+                                ..
                             } = &self.doc.node(desc).kind
                             {
-                                if elem_name == name {
+                                if elem_name == name && (!strict || namespace.is_none()) {
                                     result.push(XPathNode::Node(desc));
                                 }
                             }
@@ -644,8 +867,8 @@ impl<'a> XPathContext<'a> {
                 NodeTest::Name(name) => self.attr_name_matches(attr, name),
                 NodeTest::Wildcard | NodeTest::Node => true,
                 NodeTest::PrefixWildcard(prefix) => {
-                    if let Some(uri) = self.namespaces.get(prefix.as_str()) {
-                        attr.namespace.as_deref() == Some(uri.as_str())
+                    if let Some(uri) = self.resolve_prefix(prefix) {
+                        attr.namespace.as_deref() == Some(uri)
                     } else {
                         attr.prefix.as_deref() == Some(prefix.as_str())
                     }
@@ -667,17 +890,18 @@ impl<'a> XPathContext<'a> {
     /// A `prefix:local` test matches namespace-aware when the prefix is
     /// registered via [`set_namespace`](Self::set_namespace), and by literal
     /// prefix otherwise. An unprefixed test matches on the local name
-    /// (matching the evaluator's historical behavior for element names).
+    /// (matching the evaluator's historical behavior for element names), or
+    /// in strict mode only attributes in no namespace.
     fn attr_name_matches(&self, attr: &Attribute, name: &str) -> bool {
         if let Some(colon) = name.find(':') {
             let prefix = &name[..colon];
             let local = &name[colon + 1..];
-            if let Some(uri) = self.namespaces.get(prefix) {
-                return attr.namespace.as_deref() == Some(uri.as_str()) && attr.name == local;
+            if let Some(uri) = self.resolve_prefix(prefix) {
+                return attr.namespace.as_deref() == Some(uri) && attr.name == local;
             }
             return attr.prefix.as_deref() == Some(prefix) && attr.name == local;
         }
-        attr.name == name
+        attr.name == name && (!self.strict_names || attr.namespace.is_none())
     }
 
     // -----------------------------------------------------------------------
@@ -826,13 +1050,16 @@ impl<'a> XPathContext<'a> {
             // If the XPath name has a prefix and we have namespace bindings,
             // do namespace-aware matching.
             if let Some(colon_pos) = name.find(':') {
-                if !self.namespaces.is_empty() {
+                if self.strict_names || !self.namespaces.is_empty() {
                     let prefix = &name[..colon_pos];
                     let local = &name[colon_pos + 1..];
-                    if let Some(uri) = self.namespaces.get(prefix) {
-                        return namespace.as_deref() == Some(uri.as_str()) && elem_name == local;
+                    if let Some(uri) = self.resolve_prefix(prefix) {
+                        return namespace.as_deref() == Some(uri) && elem_name == local;
                     }
                 }
+            } else if self.strict_names {
+                // XPath 1.0 section 2.3: no prefix means no namespace.
+                return namespace.is_none() && elem_name == name;
             }
             // Default: direct string comparison (matches existing behavior)
             elem_name == name
@@ -870,8 +1097,8 @@ impl<'a> XPathContext<'a> {
                 } => {
                     // If we have namespace bindings, resolve the prefix to a URI
                     // and match against the element's namespace.
-                    if let Some(uri) = self.namespaces.get(prefix.as_str()) {
-                        namespace.as_deref() == Some(uri.as_str())
+                    if let Some(uri) = self.resolve_prefix(prefix) {
+                        namespace.as_deref() == Some(uri)
                     } else {
                         elem_prefix.as_deref() == Some(prefix.as_str())
                     }
@@ -1011,6 +1238,8 @@ impl<'a> XPathContext<'a> {
                     self.variables.clone()
                 },
                 namespaces: self.namespaces.clone(),
+                strict_names: self.strict_names,
+                functions: self.functions,
             };
             let val = ctx.eval_expr(predicate)?;
             let keep = match &val {
@@ -1154,10 +1383,35 @@ impl<'a> XPathContext<'a> {
             "max" => self.fn_max(args),
             "reverse" => self.fn_reverse(args),
 
-            _ => Err(XPathError::UndefinedFunction {
-                name: name.to_owned(),
-            }),
+            _ => self.eval_extension_function(name, args),
         }
+    }
+
+    /// Calls a host-supplied function through the [`FunctionResolver`].
+    fn eval_extension_function(&self, name: &str, args: &[Expr]) -> Result<XPathValue, XPathError> {
+        let undefined = || XPathError::UndefinedFunction {
+            name: name.to_owned(),
+        };
+        let (namespace, local) = match name.split_once(':') {
+            Some((prefix, local)) => match self.resolve_prefix(prefix) {
+                Some(uri) => (Some(uri), local),
+                None if self.strict_names => {
+                    return Err(XPathError::UndefinedNamespacePrefix {
+                        prefix: prefix.to_owned(),
+                    });
+                }
+                None => return Err(undefined()),
+            },
+            None => (None, name),
+        };
+        let resolver = self.functions.ok_or_else(undefined)?;
+        let call = ExtensionCall {
+            context: self,
+            args,
+        };
+        resolver
+            .call(local, namespace, &call)
+            .unwrap_or_else(|| Err(undefined()))
     }
 
     // -- Node-set functions -------------------------------------------------
@@ -3157,5 +3411,126 @@ mod tests {
             }
             other => panic!("expected node-set, got {other:?}"),
         }
+    }
+
+    // -- Strict names --------------------------------------------------------
+
+    fn count_strict(
+        xml: &str,
+        xpath: &str,
+        bindings: &[(&str, &str)],
+    ) -> Result<usize, XPathError> {
+        let doc = Document::parse_str(xml).unwrap();
+        let mut ctx = XPathContext::new(&doc, doc.root());
+        ctx.set_strict_names(true);
+        for (prefix, uri) in bindings {
+            ctx.set_namespace(prefix, uri);
+        }
+        match ctx.evaluate(&parse(xpath).unwrap())? {
+            XPathValue::NodeSet(nodes) => Ok(nodes.len()),
+            other => panic!("expected node-set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_strict_unprefixed_name_means_no_namespace() {
+        let xml = r#"<root xmlns="urn:d"><item/><plain xmlns=""><item/></plain></root>"#;
+        assert_eq!(count_strict(xml, "//item", &[]), Ok(1));
+        assert_eq!(count_strict(xml, "//d:item", &[("d", "urn:d")]), Ok(1));
+        assert_eq!(count_strict(xml, "//*", &[]), Ok(4));
+        // Bindings don't change what an unprefixed name means.
+        assert_eq!(count_strict(xml, "//item", &[("d", "urn:d")]), Ok(1));
+        // Without strict names, an unprefixed name matches on local name.
+        let doc = Document::parse_str(xml).unwrap();
+        let ctx = XPathContext::new(&doc, doc.root());
+        let all = ctx.evaluate(&parse("//item").unwrap()).unwrap();
+        assert_eq!(all.as_node_set().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn test_strict_unprefixed_attribute_name_means_no_namespace() {
+        let xml = r#"<root xmlns:p="urn:p" a="1" p:a="2"/>"#;
+        assert_eq!(count_strict(xml, "/root/@a", &[]), Ok(1));
+        assert_eq!(count_strict(xml, "/root/@q:a", &[("q", "urn:p")]), Ok(1));
+        assert_eq!(count_strict(xml, "/root/@q:*", &[("q", "urn:p")]), Ok(1));
+    }
+
+    #[test]
+    fn test_strict_unbound_prefix_is_an_error() {
+        let xml = "<root/>";
+        let unbound = Err(XPathError::UndefinedNamespacePrefix {
+            prefix: "nope".to_owned(),
+        });
+        assert_eq!(count_strict(xml, "//nope:item", &[]), unbound);
+        assert_eq!(count_strict(xml, "//nope:*", &[]), unbound);
+        assert_eq!(count_strict(xml, "/root[nope:x]", &[]), unbound);
+        // The xml prefix is always bound.
+        assert_eq!(
+            count_strict(r#"<r xml:lang="en"/>"#, "/r/@xml:lang", &[]),
+            Ok(1)
+        );
+    }
+
+    // -- Extension functions -------------------------------------------------
+
+    /// `ex:join(a, b)` and `ex:here()`, the context node's name.
+    struct Example;
+
+    impl FunctionResolver for Example {
+        fn call(
+            &self,
+            name: &str,
+            namespace: Option<&str>,
+            call: &ExtensionCall<'_, '_>,
+        ) -> Option<Result<XPathValue, XPathError>> {
+            if namespace != Some("urn:ex") {
+                return None;
+            }
+            match name {
+                "join" => Some(call.args().map(|args| {
+                    let parts: Vec<String> = args.iter().map(|a| call.string(a)).collect();
+                    XPathValue::String(parts.join("-"))
+                })),
+                "here" => {
+                    let id = call.context_node().anchor();
+                    let name = call.document().node_name(id).unwrap_or_default();
+                    Some(Ok(XPathValue::String(name.to_owned())))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    fn eval_with_example(xpath: &str) -> Result<XPathValue, XPathError> {
+        let doc = Document::parse_str("<root><a>x</a><b>y</b></root>").unwrap();
+        let mut ctx = XPathContext::new(&doc, doc.root());
+        ctx.set_namespace("ex", "urn:ex");
+        ctx.set_function_resolver(&Example);
+        ctx.evaluate(&parse(xpath).unwrap())
+    }
+
+    #[test]
+    fn test_extension_function_gets_evaluated_args() {
+        let result = eval_with_example("ex:join(/root/a, 'z', 1)").unwrap();
+        assert_eq!(result.to_xpath_string(), "x-z-1");
+    }
+
+    #[test]
+    fn test_extension_function_sees_predicate_context() {
+        let result = eval_with_example("count(//*[ex:here() = 'b'])").unwrap();
+        assert_eq!(result.to_number(), 1.0);
+    }
+
+    #[test]
+    fn test_extension_function_unknown_names() {
+        let undefined = |name: &str| {
+            Err(XPathError::UndefinedFunction {
+                name: name.to_owned(),
+            })
+        };
+        assert_eq!(eval_with_example("ex:missing()"), undefined("ex:missing"));
+        assert_eq!(eval_with_example("join('a')"), undefined("join"));
+        // Built-in functions take precedence over the resolver.
+        assert_eq!(eval_with_example("count(//a)").unwrap().to_number(), 1.0);
     }
 }
