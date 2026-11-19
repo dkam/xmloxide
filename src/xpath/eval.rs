@@ -474,7 +474,11 @@ impl<'a> XPathContext<'a> {
             // descendant::X — avoids materializing the huge intermediate
             // node-set that `//` produces.
             if let Some(fused) = Self::try_fuse_descendant_child(steps, i) {
-                nodes = self.apply_step(&nodes, &fused)?;
+                nodes = if fused.predicates.is_empty() {
+                    self.apply_step(&nodes, &fused)?
+                } else {
+                    self.apply_fused_step_with_predicates(&nodes, &fused)?
+                };
                 i += 2; // skip both steps
             } else {
                 nodes = self.apply_step(&nodes, step)?;
@@ -525,6 +529,46 @@ impl<'a> XPathContext<'a> {
         } else {
             None
         }
+    }
+
+    /// Applies a fused `descendant::X[p]` step with the meaning of the
+    /// `descendant-or-self::node()/child::X[p]` it replaces: each predicate
+    /// filters each parent's `X` children separately, so `//a/b[1]` and
+    /// `//b[1]` both select the first `b` of every parent. (`XPath` 1.0
+    /// section 2.5: `//para[1]` is not `/descendant::para[1]`.)
+    ///
+    /// The fused candidates with a given parent are exactly that parent's
+    /// `X` children, in document order, so grouping by parent recovers the
+    /// per-context node-sets.
+    fn apply_fused_step_with_predicates(
+        &self,
+        input: &[XPathNode],
+        step: &Step,
+    ) -> Result<Vec<XPathNode>, XPathError> {
+        let bare = Step {
+            axis: step.axis,
+            node_test: step.node_test.clone(),
+            predicates: Vec::new(),
+        };
+        let mut groups: Vec<Vec<XPathNode>> = Vec::new();
+        let mut group_of_parent: HashMap<Option<NodeId>, usize> = HashMap::new();
+        for node in self.apply_step(input, &bare)? {
+            let parent = self.doc.parent(node.anchor());
+            let group = *group_of_parent.entry(parent).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[group].push(node);
+        }
+        let mut result = Vec::new();
+        for mut group in groups {
+            for predicate in &step.predicates {
+                group = self.apply_predicate(&group, predicate)?;
+            }
+            result.extend(group);
+        }
+        sort_document_order(&mut result);
+        Ok(result)
     }
 
     fn eval_root_path(&self, steps: &[Step]) -> Result<XPathValue, XPathError> {
@@ -3532,5 +3576,28 @@ mod tests {
         assert_eq!(eval_with_example("join('a')"), undefined("join"));
         // Built-in functions take precedence over the resolver.
         assert_eq!(eval_with_example("count(//a)").unwrap().to_number(), 1.0);
+    }
+
+    #[test]
+    fn test_double_slash_positional_predicate_is_per_parent() {
+        // XPath 1.0 section 2.5: //para[1] is not /descendant::para[1].
+        let xml = "<r><d><i>1</i><s><i>2</i></s><i>3</i></d><i>4</i></r>";
+        let doc = Document::parse_str(xml).unwrap();
+        let strings = |xpath: &str| -> Vec<String> {
+            let ctx = XPathContext::new(&doc, doc.root());
+            match ctx.evaluate(&parse(xpath).unwrap()).unwrap() {
+                XPathValue::NodeSet(nodes) => nodes
+                    .into_iter()
+                    .map(|n| doc.text_content(n.anchor()))
+                    .collect(),
+                other => panic!("expected node-set, got {other:?}"),
+            }
+        };
+        assert_eq!(strings("//d//i[last()]"), ["2", "3"]);
+        assert_eq!(strings("//i[1]"), ["1", "2", "4"]);
+        assert_eq!(strings("//i[position() = last()]"), ["2", "3", "4"]);
+        assert_eq!(strings("/descendant::i[1]"), ["1"]);
+        assert_eq!(strings("(//i)[last()]"), ["4"]);
+        assert_eq!(strings("//i[. > 1]"), ["2", "3", "4"]);
     }
 }
