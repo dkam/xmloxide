@@ -1097,6 +1097,15 @@ impl Document {
             NodeKind::Document | NodeKind::DocumentType { .. } | NodeKind::EntityRef { .. } => {
                 false
             }
+            NodeKind::DocumentFragment => {
+                let children: Vec<NodeId> = self.children(id).collect();
+                for child in children {
+                    self.detach(child);
+                }
+                let text = self.create_text(content);
+                self.append_child(id, text);
+                true
+            }
         }
     }
 
@@ -2765,5 +2774,35 @@ mod tests {
         }
         assert_eq!(doc.node_name(r), Some("s"));
         assert_eq!(doc.node_namespace(r), Some("urn:s"));
+    }
+
+    #[test]
+    fn test_document_fragment_holds_siblings() {
+        use crate::serial::{serialize_node, SerializeOptions};
+        use crate::xpath::{eval::XPathContext, parser::parse, XPathValue};
+
+        let mut doc = Document::parse_str("<root/>").unwrap();
+        let fragment = doc.create_node(NodeKind::DocumentFragment);
+        let a = doc.create_element("a");
+        let text = doc.create_text("hi");
+        doc.append_child(fragment, a);
+        doc.append_child(fragment, text);
+        assert_eq!(
+            serialize_node(&doc, fragment, &SerializeOptions::default()),
+            "<a/>hi"
+        );
+        assert_eq!(doc.text_content(fragment), "hi");
+
+        let ctx = XPathContext::new(&doc, fragment);
+        let found = ctx
+            .evaluate(&parse("count(./a) + count(self::*)").unwrap())
+            .unwrap();
+        assert_eq!(found, XPathValue::Number(1.0));
+
+        assert!(doc.set_text_content(fragment, "replaced"));
+        assert_eq!(
+            serialize_node(&doc, fragment, &SerializeOptions::default()),
+            "replaced"
+        );
     }
 }

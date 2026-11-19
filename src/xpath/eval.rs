@@ -2191,9 +2191,10 @@ impl<'a> XPathContext<'a> {
         match kind {
             // EntityRef: the expansion lives in the node's children, so the
             // string-value is the same concatenation of descendant text.
-            NodeKind::Document | NodeKind::Element { .. } | NodeKind::EntityRef { .. } => {
-                self.doc.text_content(node)
-            }
+            NodeKind::Document
+            | NodeKind::DocumentFragment
+            | NodeKind::Element { .. }
+            | NodeKind::EntityRef { .. } => self.doc.text_content(node),
             NodeKind::Text { content }
             | NodeKind::CData { content }
             | NodeKind::Comment { content } => content.clone(),

@@ -418,6 +418,12 @@ fn serialize_html_node(doc: &Document, id: NodeId, out: &mut String, reencode: b
         NodeKind::Document => {
             // Should not appear as a child node
         }
+        NodeKind::DocumentFragment => {
+            // A fragment is a container: it serializes as its children.
+            for child in doc.children(id) {
+                serialize_html_node(doc, child, out, reencode);
+            }
+        }
     }
 }
 

@@ -74,4 +74,10 @@ pub enum NodeKind {
         /// The serialized internal subset content (between `[` and `]`), if any.
         internal_subset: Option<String>,
     },
+
+    /// A document fragment: a lightweight container for a list of sibling
+    /// nodes that belong to no element, like the DOM's `DocumentFragment`
+    /// (libxml2's `XML_DOCUMENT_FRAG_NODE`). It is never part of the
+    /// document tree itself; it serializes as its children.
+    DocumentFragment,
 }

@@ -374,6 +374,12 @@ fn write_node(
         NodeKind::Document => {
             // Should not appear as a child node
         }
+        NodeKind::DocumentFragment => {
+            // A fragment is a container: it serializes as its children.
+            for child in doc.children(id) {
+                write_node(doc, child, out, reencode_non_ascii, options, depth, false);
+            }
+        }
     }
 }
 

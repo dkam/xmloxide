@@ -593,6 +593,11 @@ fn serialize_node_recursive(doc: &Document, id: NodeId, out: &mut String) {
             out.push(';');
         }
         NodeKind::DocumentType { .. } | NodeKind::Document => {}
+        NodeKind::DocumentFragment => {
+            for child in doc.children(id) {
+                serialize_node_recursive(doc, child, out);
+            }
+        }
     }
 }
 
@@ -904,6 +909,10 @@ fn format_debug_node(doc: &Document, id: NodeId, depth: usize, out: &mut String)
         NodeKind::Document => {
             out.push_str(&indent);
             out.push_str("DOCUMENT\n");
+        }
+        NodeKind::DocumentFragment => {
+            out.push_str(&indent);
+            out.push_str("DOCUMENT_FRAGMENT\n");
         }
     }
 }
