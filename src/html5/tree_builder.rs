@@ -1462,24 +1462,13 @@ impl<'a> TreeBuilder<'a> {
             Some(ns.uri().to_string())
         };
 
-        let id_value = tree_attrs.iter().find_map(|a| {
-            if a.name == "id" {
-                Some(a.value.clone())
-            } else {
-                None
-            }
-        });
-
+        // `id` attributes are indexed on demand by `Document::element_by_id`.
         let node_id = self.doc.create_node(NodeKind::Element {
             name: name.to_string(),
             prefix: None,
             namespace,
             attributes: tree_attrs,
         });
-
-        if let Some(id_val) = id_value {
-            self.doc.set_id(&id_val, node_id);
-        }
 
         // Detect HTML integration point: MathML annotation-xml with
         // encoding="text/html" or "application/xhtml+xml".
