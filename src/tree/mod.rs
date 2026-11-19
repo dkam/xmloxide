@@ -511,8 +511,21 @@ impl Document {
     /// Whether `NodeId` order is currently document order, so that sorting
     /// by id sorts into document order.
     #[must_use]
-    pub fn ids_in_document_order(&self) -> bool {
+    pub(crate) fn ids_in_document_order(&self) -> bool {
         self.ids_in_order
+    }
+
+    /// Compares two nodes' positions in document order, or returns `None`
+    /// if they are in different trees (the document and a detached
+    /// subtree, say), which have no order between them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if either id is out of bounds.
+    #[must_use]
+    pub fn compare_document_order(&self, a: NodeId, b: NodeId) -> Option<std::cmp::Ordering> {
+        let top = |id| self.ancestors(id).last();
+        (top(a) == top(b)).then(|| self.document_order_key(a).cmp(&self.document_order_key(b)))
     }
 
     /// Each node's position in document order: the document first, then
@@ -541,14 +554,7 @@ impl Document {
 
     /// Whether `ancestor` is `node` or one of its ancestors.
     fn is_ancestor_or_self(&self, ancestor: NodeId, node: NodeId) -> bool {
-        let mut current = Some(node);
-        while let Some(id) = current {
-            if id == ancestor {
-                return true;
-            }
-            current = self.node(id).parent;
-        }
-        false
+        self.ancestors(node).any(|id| id == ancestor)
     }
 
     /// The last node of `id`'s subtree in document order.
@@ -1029,8 +1035,7 @@ impl Document {
     /// ```
     pub fn import_node(&mut self, source: &Document, id: NodeId) -> NodeId {
         let copy = self.create_node(source.node(id).kind.clone());
-        let children: Vec<NodeId> = source.children(id).collect();
-        for child in children {
+        for child in source.children(id) {
             let child_copy = self.import_node(source, child);
             self.append_child(copy, child_copy);
         }
@@ -1075,7 +1080,7 @@ impl Document {
                 }
                 true
             }
-            NodeKind::Element { .. } => {
+            NodeKind::Element { .. } | NodeKind::DocumentFragment => {
                 // Remove all children
                 let children: Vec<NodeId> = self.children(id).collect();
                 for child in children {
@@ -1096,15 +1101,6 @@ impl Document {
             }
             NodeKind::Document | NodeKind::DocumentType { .. } | NodeKind::EntityRef { .. } => {
                 false
-            }
-            NodeKind::DocumentFragment => {
-                let children: Vec<NodeId> = self.children(id).collect();
-                for child in children {
-                    self.detach(child);
-                }
-                let text = self.create_text(content);
-                self.append_child(id, text);
-                true
             }
         }
     }

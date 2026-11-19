@@ -216,6 +216,23 @@ pub fn decode_to_utf8(bytes: &[u8]) -> Result<String, EncodingError> {
     Ok(initial_text)
 }
 
+/// Returns the encoding named in the XML declaration at the start of
+/// `bytes`, reading the declaration as ASCII after any byte order mark.
+/// Returns `None` if there is no declaration or it names no encoding.
+///
+/// ```
+/// use xmloxide::encoding::declared_encoding;
+///
+/// let xml = b"<?xml version=\"1.0\" encoding='Shift_JIS'?><r/>";
+/// assert_eq!(declared_encoding(xml).as_deref(), Some("Shift_JIS"));
+/// assert_eq!(declared_encoding(b"<r/>"), None);
+/// ```
+#[must_use]
+pub fn declared_encoding(bytes: &[u8]) -> Option<String> {
+    let (_, bom_length) = detect_encoding(bytes);
+    extract_encoding_from_ascii_bytes(&bytes[bom_length..])
+}
+
 /// Extracts the `encoding` attribute from raw bytes by treating them as ASCII.
 ///
 /// This is used as a fallback when the input is not valid UTF-8 and has no BOM.

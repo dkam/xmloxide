@@ -28,10 +28,9 @@ use std::collections::{HashMap, HashSet};
 
 use super::ast::{Axis, BinaryOp, Expr, NodeTest, Step};
 use super::types::{XPathError, XPathNode};
-use crate::tree::{Attribute, Document, NodeId, NodeKind};
-
-/// The XML namespace, which the `xml` prefix is always bound to.
-const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+use crate::parser::input::XML_NAMESPACE;
+use crate::tree::{Attribute, Descendants, Document, NodeId, NodeKind};
+use crate::util::qname::split_qname;
 
 /// Functions supplied by the host application, beyond the built-in library.
 ///
@@ -95,6 +94,15 @@ impl<'a> ExtensionCall<'_, 'a> {
     #[must_use]
     pub fn arg_count(&self) -> usize {
         self.args.len()
+    }
+
+    /// Checks that the function `name` was passed `expected` arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XPathError::InvalidArgCount`] otherwise.
+    pub fn check_arg_count(&self, name: &str, expected: usize) -> Result<(), XPathError> {
+        check_arg_count(name, self.args, expected)
     }
 
     /// Evaluates the arguments, in order.
@@ -326,7 +334,7 @@ impl<'a> XPathContext<'a> {
     /// never reached (`false() and x:y`) can't fail.
     fn check_step_prefix(&self, step: &Step) -> Result<(), XPathError> {
         let prefix = match &step.node_test {
-            NodeTest::Name(name) => name.split_once(':').map(|(p, _)| p),
+            NodeTest::Name(name) => split_qname(name).0,
             NodeTest::PrefixWildcard(prefix) => Some(prefix.as_str()),
             _ => None,
         };
@@ -681,60 +689,31 @@ impl<'a> XPathContext<'a> {
         if let NodeTest::Name(name) = test {
             let strict = self.strict_names;
             if !name.contains(':') && (strict || self.namespaces.is_empty()) {
+                let matches = |id: NodeId| {
+                    matches!(
+                        &self.doc.node(id).kind,
+                        NodeKind::Element { name: elem_name, namespace, .. }
+                            if elem_name == name && (!strict || namespace.is_none())
+                    )
+                };
+                let hits = |ids: &mut Vec<XPathNode>, candidates: Descendants<'_>| {
+                    ids.extend(candidates.filter(|&id| matches(id)).map(XPathNode::Node));
+                };
                 match axis {
                     Axis::Child => {
-                        for child in self.doc.children(node) {
-                            if let NodeKind::Element {
-                                name: elem_name,
-                                namespace,
-                                ..
-                            } = &self.doc.node(child).kind
-                            {
-                                if elem_name == name && (!strict || namespace.is_none()) {
-                                    result.push(XPathNode::Node(child));
-                                }
-                            }
-                        }
+                        let children = self.doc.children(node);
+                        result.extend(children.filter(|&id| matches(id)).map(XPathNode::Node));
                         return;
                     }
                     Axis::Descendant => {
-                        for desc in self.doc.descendants(node) {
-                            if let NodeKind::Element {
-                                name: elem_name,
-                                namespace,
-                                ..
-                            } = &self.doc.node(desc).kind
-                            {
-                                if elem_name == name && (!strict || namespace.is_none()) {
-                                    result.push(XPathNode::Node(desc));
-                                }
-                            }
-                        }
+                        hits(result, self.doc.descendants(node));
                         return;
                     }
                     Axis::DescendantOrSelf => {
-                        if let NodeKind::Element {
-                            name: elem_name,
-                            namespace,
-                            ..
-                        } = &self.doc.node(node).kind
-                        {
-                            if elem_name == name && (!strict || namespace.is_none()) {
-                                result.push(XPathNode::Node(node));
-                            }
+                        if matches(node) {
+                            result.push(XPathNode::Node(node));
                         }
-                        for desc in self.doc.descendants(node) {
-                            if let NodeKind::Element {
-                                name: elem_name,
-                                namespace,
-                                ..
-                            } = &self.doc.node(desc).kind
-                            {
-                                if elem_name == name && (!strict || namespace.is_none()) {
-                                    result.push(XPathNode::Node(desc));
-                                }
-                            }
-                        }
+                        hits(result, self.doc.descendants(node));
                         return;
                     }
                     _ => {} // fall through to generic path
@@ -1422,8 +1401,8 @@ impl<'a> XPathContext<'a> {
         let undefined = || XPathError::UndefinedFunction {
             name: name.to_owned(),
         };
-        let (namespace, local) = match name.split_once(':') {
-            Some((prefix, local)) => match self.resolve_prefix(prefix) {
+        let (namespace, local) = match split_qname(name) {
+            (Some(prefix), local) => match self.resolve_prefix(prefix) {
                 Some(uri) => (Some(uri), local),
                 None if self.strict_names => {
                     return Err(XPathError::UndefinedNamespacePrefix {
@@ -1432,7 +1411,7 @@ impl<'a> XPathContext<'a> {
                 }
                 None => return Err(undefined()),
             },
-            None => (None, name),
+            (None, _) => (None, name),
         };
         let resolver = self.functions.ok_or_else(undefined)?;
         let call = ExtensionCall {

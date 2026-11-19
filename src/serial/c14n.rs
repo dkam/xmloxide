@@ -248,8 +248,7 @@ impl<'a> C14nContext<'a> {
             }
             NodeKind::DocumentFragment => {
                 // A fragment is a container: its children are output.
-                let children: Vec<NodeId> = self.doc.children(id).collect();
-                for child in children {
+                for child in self.doc.children(id) {
                     self.process_node(child);
                 }
             }
