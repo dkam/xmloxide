@@ -23,6 +23,7 @@
 //! boolean, and number function groups). A host application can add its own
 //! through [`FunctionResolver`].
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use super::ast::{Axis, BinaryOp, Expr, NodeTest, Step};
@@ -183,14 +184,16 @@ pub struct XPathContext<'a> {
     /// The size of the context node-set.
     context_size: usize,
     /// Variable bindings available during evaluation.
-    variables: HashMap<String, XPathValue>,
+    ///
+    /// Borrowed, not copied, by the contexts created for predicates.
+    variables: Cow<'a, HashMap<String, XPathValue>>,
     /// Namespace prefix → URI bindings for resolving prefixed name tests.
     ///
     /// When set (e.g., via Schematron `<sch:ns>` bindings), prefixed names
     /// like `inv:invoice` in `XPath` expressions are matched by resolving
     /// the prefix to a URI and comparing against the element's namespace URI
     /// and local name.
-    namespaces: HashMap<String, String>,
+    namespaces: Cow<'a, HashMap<String, String>>,
     /// Resolve names exactly as `XPath` 1.0 section 2.3 specifies; see
     /// [`set_strict_names`](Self::set_strict_names).
     strict_names: bool,
@@ -228,8 +231,8 @@ impl<'a> XPathContext<'a> {
             context_node,
             context_position: 1,
             context_size: 1,
-            variables: HashMap::new(),
-            namespaces: HashMap::new(),
+            variables: Cow::Owned(HashMap::new()),
+            namespaces: Cow::Owned(HashMap::new()),
             strict_names: false,
             functions: None,
         }
@@ -250,7 +253,9 @@ impl<'a> XPathContext<'a> {
     /// This is used by Schematron validation to pass `<sch:ns>` bindings
     /// to the `XPath` evaluator.
     pub fn set_namespace(&mut self, prefix: &str, uri: &str) {
-        self.namespaces.insert(prefix.to_owned(), uri.to_owned());
+        self.namespaces
+            .to_mut()
+            .insert(prefix.to_owned(), uri.to_owned());
     }
 
     /// Resolves name tests exactly as `XPath` 1.0 section 2.3 specifies, as
@@ -279,7 +284,7 @@ impl<'a> XPathContext<'a> {
     /// Variable references in expressions (e.g., `$x`) will resolve to the
     /// value set here.
     pub fn set_variable(&mut self, name: &str, value: XPathValue) {
-        self.variables.insert(name.to_owned(), value);
+        self.variables.to_mut().insert(name.to_owned(), value);
     }
 
     /// Evaluates an `XPath` expression AST against this context.
@@ -1274,14 +1279,10 @@ impl<'a> XPathContext<'a> {
                 context_node: node,
                 context_position: i + 1, // 1-based
                 context_size: size,
-                // Share the variables reference — avoid cloning the HashMap.
-                // HashMap::new() doesn't allocate, so this is free when empty.
-                variables: if self.variables.is_empty() {
-                    HashMap::new()
-                } else {
-                    self.variables.clone()
-                },
-                namespaces: self.namespaces.clone(),
+                // Borrow the parent's bindings: copying them for every
+                // candidate node would make each predicate O(bindings).
+                variables: Cow::Borrowed(&*self.variables),
+                namespaces: Cow::Borrowed(&*self.namespaces),
                 strict_names: self.strict_names,
                 functions: self.functions,
             };
@@ -3513,6 +3514,17 @@ mod tests {
             count_strict(r#"<r xml:lang="en"/>"#, "/r/@xml:lang", &[]),
             Ok(1)
         );
+    }
+
+    #[test]
+    fn test_predicate_contexts_see_bindings() {
+        let xml = r#"<r xmlns:p="urn:p"><p:a n="1"/><p:a n="2"/></r>"#;
+        let doc = Document::parse_str(xml).unwrap();
+        let mut ctx = XPathContext::new(&doc, doc.root());
+        ctx.set_namespace("q", "urn:p");
+        ctx.set_variable("want", XPathValue::String("2".to_owned()));
+        let result = ctx.evaluate(&parse("count(//q:a[@n = $want][self::q:a])").unwrap());
+        assert_eq!(result, Ok(XPathValue::Number(1.0)));
     }
 
     // -- Extension functions -------------------------------------------------
