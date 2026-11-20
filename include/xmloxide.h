@@ -71,6 +71,7 @@ typedef struct xmloxide_reader xmloxide_reader;
 #define XMLOXIDE_NODE_COMMENT      8
 #define XMLOXIDE_NODE_DOCUMENT     9
 #define XMLOXIDE_NODE_DOCUMENT_TYPE 10
+#define XMLOXIDE_NODE_DOCUMENT_FRAGMENT 11
 
 /* ---------- XPath result type constants ---------- */
 

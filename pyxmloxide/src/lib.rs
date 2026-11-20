@@ -87,6 +87,7 @@ impl Document {
             NodeKind::ProcessingInstruction { .. } => "processing_instruction",
             NodeKind::EntityRef { .. } => "entity_ref",
             NodeKind::DocumentType { .. } => "document_type",
+            NodeKind::DocumentFragment => "document_fragment",
         }
     }
 

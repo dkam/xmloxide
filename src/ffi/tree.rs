@@ -25,6 +25,8 @@ pub const XMLOXIDE_NODE_COMMENT: i32 = 8;
 pub const XMLOXIDE_NODE_DOCUMENT: i32 = 9;
 /// Document type node type constant.
 pub const XMLOXIDE_NODE_DOCUMENT_TYPE: i32 = 10;
+/// Document fragment node type constant.
+pub const XMLOXIDE_NODE_DOCUMENT_FRAGMENT: i32 = 11;
 
 /// Helper to convert `Option<NodeId>` to a raw u32 (0 = no node).
 fn node_id_to_raw(id: Option<NodeId>) -> u32 {
@@ -160,6 +162,7 @@ pub unsafe extern "C" fn xmloxide_node_type(doc: *const Document, node: u32) -> 
         NodeKind::ProcessingInstruction { .. } => XMLOXIDE_NODE_PI,
         NodeKind::EntityRef { .. } => XMLOXIDE_NODE_ENTITY_REF,
         NodeKind::DocumentType { .. } => XMLOXIDE_NODE_DOCUMENT_TYPE,
+        NodeKind::DocumentFragment => XMLOXIDE_NODE_DOCUMENT_FRAGMENT,
     }
 }
 
@@ -731,5 +734,20 @@ pub unsafe extern "C" fn xmloxide_node_prefix(doc: *const Document, node: u32) -
     match doc.node_prefix(node_id) {
         Some(prefix) => to_c_string(prefix),
         None => std::ptr::null_mut(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_node_type_document_fragment() {
+        let mut doc = Document::new();
+        let fragment = doc.create_node(NodeKind::DocumentFragment);
+        let node_type = unsafe { xmloxide_node_type(&doc, fragment.into_raw()) };
+        assert_eq!(node_type, XMLOXIDE_NODE_DOCUMENT_FRAGMENT);
+        assert_eq!(XMLOXIDE_NODE_DOCUMENT_FRAGMENT, 11);
     }
 }
