@@ -59,6 +59,9 @@ pub enum Event<'a> {
     Text(&'a str),
     /// The content of a CDATA section.
     CData(&'a str),
+    /// The content of an HTML element whose content is raw text (`script`,
+    /// `style`), as it is in the input.
+    RawText(&'a str),
     /// The content of a comment.
     Comment(&'a str),
     /// A processing instruction.
@@ -106,12 +109,11 @@ pub fn parse_str(
     options: &ParseOptions,
     handler: &mut dyn EventHandler,
 ) -> Result<(), ParseError> {
-    crate::parser::parse_str_reporting(input, options, handler).map(drop)
+    crate::parser::parse_str_reporting(input, options, handler)
 }
 
 /// Parses `input` as HTML, reporting what it finds to `handler`. Elements
-/// are reported as they are opened and closed, implied ones included, and
-/// raw text (the content of `script` and the like) as text.
+/// are reported as they are opened and closed, implied ones included.
 ///
 /// # Errors
 ///
@@ -122,49 +124,87 @@ pub fn parse_html(
     options: &HtmlParseOptions,
     handler: &mut dyn EventHandler,
 ) -> Result<(), ParseError> {
-    crate::html::parse_html_reporting(input, options, handler).map(drop)
+    crate::html::parse_html_reporting(input, options, handler)
 }
 
-/// Reports `diagnostics` from `*reported` on, then `event` at `location`.
-pub(crate) fn report(
-    handler: &mut dyn EventHandler,
-    diagnostics: &[ParseDiagnostic],
-    reported: &mut usize,
-    event: Event<'_>,
-    location: SourceLocation,
-) {
-    report_diagnostics(handler, diagnostics, reported);
-    handler.event(event, location);
+/// Where a parser reports its events, if anywhere, and how many of the
+/// parser's diagnostics it has reported.
+pub(crate) struct Reporter<'h> {
+    handler: Option<&'h mut dyn EventHandler>,
+    reported: usize,
 }
 
-/// Reports how a parse ended: the fatal error that stopped it, if one did,
-/// then the end of the document, at `location`.
-pub(crate) fn report_end(
-    handler: &mut dyn EventHandler,
-    error: Option<&ParseError>,
-    location: SourceLocation,
-) {
-    if let Some(error) = error {
-        let fatal = ParseDiagnostic {
-            severity: ErrorSeverity::Fatal,
-            message: error.message.clone(),
-            location: error.location,
+impl<'h> Reporter<'h> {
+    pub(crate) fn new(handler: Option<&'h mut dyn EventHandler>) -> Self {
+        Reporter {
+            handler,
+            reported: 0,
+        }
+    }
+
+    /// Reports `event` at `location`, after the `diagnostics` not yet
+    /// reported.
+    pub(crate) fn event(
+        &mut self,
+        diagnostics: &[ParseDiagnostic],
+        event: Event<'_>,
+        location: SourceLocation,
+    ) {
+        self.diagnostics(diagnostics);
+        if let Some(handler) = self.handler.as_deref_mut() {
+            handler.event(event, location);
+        }
+    }
+
+    /// Reports the `diagnostics` not yet reported.
+    pub(crate) fn diagnostics(&mut self, diagnostics: &[ParseDiagnostic]) {
+        if let (Some(handler), Some(new)) = (
+            self.handler.as_deref_mut(),
+            diagnostics.get(self.reported..),
+        ) {
+            for diagnostic in new {
+                handler.event(Event::Diagnostic(diagnostic), diagnostic.location);
+            }
+            self.reported = diagnostics.len();
+        }
+    }
+
+    /// Lends the handler to the parser of an entity's replacement text,
+    /// which has diagnostics of its own.
+    pub(crate) fn lend(&mut self) -> Reporter<'h> {
+        Reporter::new(self.handler.take())
+    }
+
+    /// Takes the handler back from `sub`, once the parser's `diagnostics`,
+    /// `sub`'s included, have all been reported.
+    pub(crate) fn take_back(&mut self, sub: &mut Reporter<'h>, diagnostics: &[ParseDiagnostic]) {
+        self.handler = sub.handler.take();
+        self.reported = diagnostics.len();
+    }
+
+    /// Reports how a parse ended: the `diagnostics` not yet reported, the
+    /// fatal error that stopped it, if one did, then the end of the
+    /// document, at `location`.
+    pub(crate) fn finish(
+        &mut self,
+        diagnostics: &[ParseDiagnostic],
+        error: Option<&ParseError>,
+        location: SourceLocation,
+    ) {
+        self.diagnostics(diagnostics);
+        let Some(handler) = self.handler.take() else {
+            return;
         };
-        handler.event(Event::Diagnostic(&fatal), error.location);
+        if let Some(error) = error {
+            let fatal = ParseDiagnostic {
+                severity: ErrorSeverity::Fatal,
+                message: error.message.clone(),
+                location: error.location,
+            };
+            handler.event(Event::Diagnostic(&fatal), error.location);
+        }
+        handler.event(Event::EndDocument, location);
     }
-    handler.event(Event::EndDocument, location);
-}
-
-/// Reports `diagnostics` from `*reported` on.
-pub(crate) fn report_diagnostics(
-    handler: &mut dyn EventHandler,
-    diagnostics: &[ParseDiagnostic],
-    reported: &mut usize,
-) {
-    for diagnostic in &diagnostics[*reported..] {
-        handler.event(Event::Diagnostic(diagnostic), diagnostic.location);
-    }
-    *reported = diagnostics.len();
 }
 
 #[cfg(test)]
@@ -181,6 +221,22 @@ mod tests {
     /// The events for HTML `input`, one line each.
     fn html_events(input: &str) -> Vec<String> {
         lines_of(|handler| parse_html(input, &HtmlParseOptions::default(), handler)).0
+    }
+
+    /// The name, line and column of each start tag in `input`.
+    fn start_locations(input: &str) -> Vec<(String, u32, u32)> {
+        let mut starts = Vec::new();
+        parse_str(
+            input,
+            &ParseOptions::default(),
+            &mut |event: Event<'_>, at: SourceLocation| {
+                if let Event::StartElement { name, .. } = event {
+                    starts.push((name.to_owned(), at.line, at.column));
+                }
+            },
+        )
+        .unwrap();
+        starts
     }
 
     /// The events `parse` reports, one line each, and whether it failed.
@@ -220,6 +276,7 @@ mod tests {
                 } => format!("end {}", name(prefix, local, namespace)),
                 Event::Text(text) => format!("text {text:?}"),
                 Event::CData(text) => format!("cdata {text:?}"),
+                Event::RawText(text) => format!("raw-text {text:?}"),
                 Event::Comment(text) => format!("comment {text:?}"),
                 Event::ProcessingInstruction { target, data } => format!("pi {target} {data:?}"),
                 Event::EntityReference { name, replacement } => {
@@ -312,20 +369,9 @@ mod tests {
 
     #[test]
     fn test_parse_str_locates_a_start_tag_at_its_end() {
-        let mut starts = Vec::new();
         let input = "<hello>\n\nworld\n<inter>\n    <net>\n    </net>\n</inter>\n</hello>";
-        parse_str(
-            input,
-            &ParseOptions::default(),
-            &mut |event: Event<'_>, at: SourceLocation| {
-                if let Event::StartElement { name, .. } = event {
-                    starts.push((name.to_owned(), at.line, at.column));
-                }
-            },
-        )
-        .unwrap();
         assert_eq!(
-            starts,
+            start_locations(input),
             [
                 ("hello".to_owned(), 1, 7),
                 ("inter".to_owned(), 4, 7),
@@ -361,7 +407,7 @@ mod tests {
                 r#"text "c""#,
                 "warning stray end tag </b>",
                 "start script",
-                r#"text "x<y""#,
+                r#"raw-text "x<y""#,
                 "end script",
                 r#"comment "m""#,
                 "warning implicitly closing <p> before </body>",
@@ -398,20 +444,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_str_locates_entity_text_at_the_reference() {
-        let mut starts = Vec::new();
+    fn test_parse_str_locates_entity_text_within_the_entity() {
+        // As libxml2 does, and as the replacement text's diagnostics are.
         let input = "<!DOCTYPE r [<!ENTITY m \"x<b>y</b>\">]>\n\n\n<r>&m;</r>";
-        parse_str(
-            input,
-            &ParseOptions::default(),
-            &mut |event: Event<'_>, at: SourceLocation| {
-                if let Event::StartElement { name, .. } = event {
-                    starts.push((name.to_owned(), at.line, at.column));
-                }
-            },
-        )
-        .unwrap();
-        assert_eq!(starts, [("r".to_owned(), 4, 3), ("b".to_owned(), 4, 7)]);
+        assert_eq!(
+            start_locations(input),
+            [("r".to_owned(), 4, 3), ("b".to_owned(), 1, 4)]
+        );
     }
 
     #[test]

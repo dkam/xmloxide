@@ -19,7 +19,7 @@ pub use push::PushParser;
 use std::sync::Arc;
 
 use crate::error::ParseError;
-use crate::events::EventHandler;
+use crate::events::{EventHandler, Reporter};
 use crate::tree::Document;
 
 use input::{
@@ -304,16 +304,10 @@ pub(crate) fn parse_str_reporting(
     input: &str,
     options: &ParseOptions,
     handler: &mut dyn EventHandler,
-) -> Result<Document, ParseError> {
+) -> Result<(), ParseError> {
     let mut parser = xml::XmlParser::new(input, options);
-    parser.events = Some(handler);
-    let result = parser.parse();
-    if result.is_err() {
-        parser.report_diagnostics();
-    }
-    let location = parser.location();
-    if let Some(handler) = parser.events {
-        crate::events::report_end(handler, result.as_ref().err(), location);
-    }
+    parser.reporter = Reporter::new(Some(handler));
+    let result = parser.parse().map(drop);
+    parser.report_end(result.as_ref().err());
     result
 }

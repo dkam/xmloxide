@@ -27,7 +27,7 @@
 pub mod entities;
 
 use crate::error::{ErrorSeverity, ParseDiagnostic, ParseError};
-use crate::events::{report, report_diagnostics, report_end, Event, EventHandler};
+use crate::events::{Event, EventHandler, Reporter};
 use crate::parser::input::ParserInput;
 use crate::tree::{Attribute, Document, NodeId, NodeKind};
 
@@ -191,17 +191,14 @@ pub(crate) fn parse_html_reporting(
     input: &str,
     options: &HtmlParseOptions,
     handler: &mut dyn EventHandler,
-) -> Result<Document, ParseError> {
+) -> Result<(), ParseError> {
     let mut parser = HtmlParser::new(input, options);
-    parser.events = Some(handler);
-    let result = parser.parse();
-    if result.is_err() {
-        parser.report_diagnostics();
-    }
+    parser.reporter = Reporter::new(Some(handler));
+    let result = parser.parse().map(drop);
     let location = parser.input.location();
-    if let Some(handler) = parser.events {
-        report_end(handler, result.as_ref().err(), location);
-    }
+    parser
+        .reporter
+        .finish(&parser.doc.diagnostics, result.as_ref().err(), location);
     result
 }
 
@@ -333,9 +330,7 @@ struct HtmlParser<'a, 'h> {
     /// are dropped too (libxml2's `ctxt->depth`).
     dropped_heads: usize,
     /// Where to report parse events, if anywhere.
-    events: Option<&'h mut dyn EventHandler>,
-    /// How many of the document's diagnostics have been reported as events.
-    reported: usize,
+    reporter: Reporter<'h>,
 }
 
 impl<'a> HtmlParser<'a, '_> {
@@ -350,72 +345,41 @@ impl<'a> HtmlParser<'a, '_> {
             open_elements: Vec::new(),
             fatal_error: None,
             dropped_heads: 0,
-            events: None,
-            reported: 0,
+            reporter: Reporter::new(None),
         }
     }
 
     /// Reports `event`, after any diagnostics not yet reported.
     fn emit(&mut self, event: Event<'_>) {
-        if let Some(handler) = self.events.as_deref_mut() {
-            let location = self.input.location();
-            report(
-                handler,
-                &self.doc.diagnostics,
-                &mut self.reported,
-                event,
-                location,
-            );
-        }
-    }
-
-    /// Reports the diagnostics not yet reported.
-    fn report_diagnostics(&mut self) {
-        if let Some(handler) = self.events.as_deref_mut() {
-            report_diagnostics(handler, &self.doc.diagnostics, &mut self.reported);
-        }
+        let location = self.input.location();
+        self.reporter.event(&self.doc.diagnostics, event, location);
     }
 
     /// Opens `element`, which `tag` names: it is where content goes until
     /// it is closed.
     fn open_element(&mut self, element: NodeId, tag: String) {
-        if let Some(handler) = self.events.as_deref_mut() {
-            if let NodeKind::Element { attributes, .. } = &self.doc.node(element).kind {
-                let event = Event::StartElement {
-                    name: &tag,
-                    prefix: None,
-                    namespace: None,
-                    attributes,
-                };
-                let location = self.input.location();
-                report(
-                    handler,
-                    &self.doc.diagnostics,
-                    &mut self.reported,
-                    event,
-                    location,
-                );
-            }
+        if let NodeKind::Element { attributes, .. } = &self.doc.node(element).kind {
+            let event = Event::StartElement {
+                name: &tag,
+                prefix: None,
+                namespace: None,
+                attributes,
+            };
+            let location = self.input.location();
+            self.reporter.event(&self.doc.diagnostics, event, location);
         }
         self.open_elements.push((element, tag));
     }
 
-    /// Closes the open elements after the first `len`, innermost first.
-    fn close_elements(&mut self, len: usize) {
-        while self.open_elements.len() > len {
-            if let Some((_, tag)) = self.open_elements.pop() {
-                self.emit(Event::EndElement {
-                    name: &tag,
-                    prefix: None,
-                    namespace: None,
-                });
-            }
-        }
-    }
-
     /// Closes the innermost open element.
     fn close_element(&mut self) {
-        self.close_elements(self.open_elements.len().saturating_sub(1));
+        if let Some((_, tag)) = self.open_elements.pop() {
+            self.emit(Event::EndElement {
+                name: &tag,
+                prefix: None,
+                namespace: None,
+            });
+        }
     }
 
     /// Appends a comment to the current element.
@@ -467,7 +431,7 @@ impl<'a> HtmlParser<'a, '_> {
             self.push_warning(message);
             self.close_element();
         }
-        self.report_diagnostics();
+        self.reporter.diagnostics(&self.doc.diagnostics);
 
         // Add default DOCTYPE if none was in the input and not disabled
         if !has_doctype && !self.options.no_default_doctype {
@@ -898,7 +862,7 @@ impl<'a> HtmlParser<'a, '_> {
         if let Some(idx) = found {
             // Close everything above and including the matched element,
             // innermost first, each intervening one after a warning.
-            while let Some((_, closed_tag)) = self.open_elements.get(idx..).and_then(<[_]>::last) {
+            while let Some((_, closed_tag)) = self.open_elements[idx..].last() {
                 if *closed_tag != lower_tag {
                     let message =
                         format!("implicitly closing <{closed_tag}> before </{lower_tag}>");
@@ -1179,7 +1143,7 @@ impl<'a> HtmlParser<'a, '_> {
         }
 
         if !content.is_empty() {
-            self.emit(Event::Text(&content));
+            self.emit(Event::RawText(&content));
             let parent = self.current_parent();
             let text_id = self.doc.create_node(NodeKind::Text { content });
             self.doc.append_child(parent, text_id);

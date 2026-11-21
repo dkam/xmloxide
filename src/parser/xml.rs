@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 
-use crate::error::{ErrorSeverity, ParseError, SourceLocation};
-use crate::events::{report, report_diagnostics, Event, EventHandler};
+use crate::error::{ErrorSeverity, ParseError};
+use crate::events::{Event, Reporter};
 use crate::tree::{Attribute, Document, NodeId, NodeKind};
 use crate::validation::dtd::{parse_dtd, serialize_dtd, AttributeDecl, AttributeType, EntityKind};
 
@@ -56,12 +56,7 @@ pub(crate) struct XmlParser<'a, 'h> {
     /// Current nesting depth of general entity expansion (0 = document level).
     entity_depth: u32,
     /// Where to report parse events, if anywhere.
-    pub(crate) events: Option<&'h mut dyn EventHandler>,
-    /// How many of the input's diagnostics have been reported as events.
-    reported: usize,
-    /// For a parser of an entity's replacement text, where the reference
-    /// is in the document: the location of its events.
-    reference: Option<SourceLocation>,
+    pub(crate) reporter: Reporter<'h>,
 }
 
 impl<'a> XmlParser<'a, '_> {
@@ -85,86 +80,54 @@ impl<'a> XmlParser<'a, '_> {
             input_size: input.len(),
             expansion_size: 0,
             entity_depth: 0,
-            events: None,
-            reported: 0,
-            reference: None,
+            reporter: Reporter::new(None),
         }
-    }
-
-    /// Where the parser is in the document: in an entity's replacement
-    /// text, at the reference.
-    pub(crate) fn location(&self) -> SourceLocation {
-        self.reference.unwrap_or_else(|| self.input.location())
     }
 
     /// Reports `event`, after any diagnostics not yet reported.
     fn emit(&mut self, event: Event<'_>) {
-        let location = self.location();
-        if let Some(handler) = self.events.as_deref_mut() {
-            report(
-                handler,
-                &self.input.diagnostics,
-                &mut self.reported,
-                event,
-                location,
-            );
-        }
+        let location = self.input.location();
+        self.reporter
+            .event(&self.input.diagnostics, event, location);
     }
 
     /// Reports the diagnostics not yet reported.
-    pub(crate) fn report_diagnostics(&mut self) {
-        if let Some(handler) = self.events.as_deref_mut() {
-            report_diagnostics(handler, &self.input.diagnostics, &mut self.reported);
-        }
+    fn report_diagnostics(&mut self) {
+        self.reporter.diagnostics(&self.input.diagnostics);
     }
 
-    /// Reports the end of `element`.
-    fn emit_end_element(&mut self, element: NodeId) {
-        let location = self.location();
-        let Some(handler) = self.events.as_deref_mut() else {
-            return;
-        };
-        if let NodeKind::Element {
-            name,
-            prefix,
-            namespace,
-            ..
-        } = &self.doc.node(element).kind
-        {
-            let event = Event::EndElement {
+    /// Reports the end of `node`: an element's end tag, or an entity
+    /// reference, after the events for its replacement text.
+    fn emit_end(&mut self, node: NodeId) {
+        let event = match &self.doc.node(node).kind {
+            NodeKind::Element {
+                name,
+                prefix,
+                namespace,
+                ..
+            } => Event::EndElement {
                 name,
                 prefix: prefix.as_deref(),
                 namespace: namespace.as_deref(),
-            };
-            report(
-                handler,
-                &self.input.diagnostics,
-                &mut self.reported,
-                event,
-                location,
-            );
-        }
-    }
-
-    /// Reports the entity reference `reference`.
-    fn emit_entity_reference(&mut self, reference: NodeId) {
-        let location = self.location();
-        let Some(handler) = self.events.as_deref_mut() else {
-            return;
-        };
-        if let NodeKind::EntityRef { name, value } = &self.doc.node(reference).kind {
-            let event = Event::EntityReference {
+            },
+            NodeKind::EntityRef { name, value } => Event::EntityReference {
                 name,
                 replacement: value.as_deref(),
-            };
-            report(
-                handler,
-                &self.input.diagnostics,
-                &mut self.reported,
-                event,
-                location,
-            );
-        }
+            },
+            _ => return,
+        };
+        let location = self.input.location();
+        self.reporter
+            .event(&self.input.diagnostics, event, location);
+    }
+
+    /// Reports how the parse ended: the diagnostics not yet reported, the
+    /// fatal `error` that stopped it, if one did, and the end of the
+    /// document.
+    pub(crate) fn report_end(&mut self, error: Option<&ParseError>) {
+        let location = self.input.location();
+        self.reporter
+            .finish(&self.input.diagnostics, error, location);
     }
 
     /// Main parse entry point. Parses the entire document.
@@ -919,15 +882,15 @@ impl<'a> XmlParser<'a, '_> {
             }
         }
 
-        // Consume the original name String via split_owned_name, avoiding a
-        // re-allocation for unprefixed names (the common case). For unprefixed
-        // names, split_owned_name returns (None, name) — just a move, zero copy.
         self.emit(Event::StartElement {
             name: local_name,
             prefix,
             namespace: elem_ns.as_deref(),
             attributes: &attributes,
         });
+        // Consume the original name String via split_owned_name, avoiding a
+        // re-allocation for unprefixed names (the common case). For unprefixed
+        // names, split_owned_name returns (None, name) — just a move, zero copy.
         let (elem_prefix_owned, elem_local_owned) = split_owned_name(name);
         let elem_id = self.doc.create_node(NodeKind::Element {
             name: elem_local_owned,
@@ -940,7 +903,7 @@ impl<'a> XmlParser<'a, '_> {
         // Empty element tag <foo/>
         if self.input.looking_at(b"/>") {
             self.input.advance(2);
-            self.emit_end_element(elem_id);
+            self.emit_end(elem_id);
             if has_ns_decls {
                 self.ns.pop_scope();
             }
@@ -982,7 +945,7 @@ impl<'a> XmlParser<'a, '_> {
         }
         self.input.skip_whitespace();
         self.input.expect_byte(b'>')?;
-        self.emit_end_element(elem_id);
+        self.emit_end(elem_id);
 
         // Pop the namespace scope when leaving this element (only if we pushed).
         if has_ns_decls {
@@ -1278,7 +1241,7 @@ impl<'a> XmlParser<'a, '_> {
                 self.parse_replacement_as_content(&name, &replacement, ref_id)?;
             }
         }
-        self.emit_entity_reference(ref_id);
+        self.emit_end(ref_id);
         Ok(())
     }
 
@@ -1319,16 +1282,13 @@ impl<'a> XmlParser<'a, '_> {
         sub.attr_types = std::mem::take(&mut self.attr_types);
         sub.attr_defaults = std::mem::take(&mut self.attr_defaults);
         std::mem::swap(&mut sub.ns, &mut self.ns);
-        // The sub-parser reports the replacement text's events, located at
-        // the reference.
+        // The sub-parser reports the replacement text's events.
         self.report_diagnostics();
-        sub.events = self.events.take();
-        sub.reference = Some(self.location());
+        sub.reporter = self.reporter.lend();
 
         let sub_root = sub.doc.root();
         let result = sub.parse_content_fragment(sub_root);
         sub.report_diagnostics();
-        self.events = sub.events.take();
 
         // Restore shared state regardless of outcome.
         self.input.entity_map = std::mem::take(&mut sub.input.entity_map);
@@ -1341,7 +1301,8 @@ impl<'a> XmlParser<'a, '_> {
         if !sub.input.diagnostics.is_empty() {
             self.input.diagnostics.append(&mut sub.input.diagnostics);
         }
-        self.reported = self.input.diagnostics.len();
+        self.reporter
+            .take_back(&mut sub.reporter, &self.input.diagnostics);
 
         if let Err(e) = result {
             // Propagate security-limit errors and already-wrapped entity
@@ -1811,6 +1772,24 @@ mod tests {
     fn test_parse_error_unexpected_eof() {
         let result = Document::parse_str("<a>");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_str_reports_an_unterminated_comment_pi_or_cdata_at_the_end() {
+        // Where libxml2 reports them: the input ran out looking for the end.
+        for (input, line, column) in [
+            ("<r><!-- a > b", 1, 14),
+            ("<r><?p a > b", 1, 13),
+            ("<r><![CDATA[ a > b", 1, 19),
+            ("<r>\n<!-- a\nb c", 3, 4),
+        ] {
+            let error = crate::parser::parse_str(input).unwrap_err();
+            assert_eq!(
+                (error.location.line, error.location.column),
+                (line, column),
+                "{input}"
+            );
+        }
     }
 
     #[test]

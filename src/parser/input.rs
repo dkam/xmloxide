@@ -1659,6 +1659,14 @@ impl<'a> ParserInput<'a> {
         }
     }
 
+    /// Creates a fatal `ParseError` at the end of the input, for a construct
+    /// the input ends inside: as in libxml2, which reads to the end looking
+    /// for the construct's end.
+    pub fn fatal_at_end(&mut self, message: impl Into<String>) -> ParseError {
+        self.advance_counting_lines(self.input.len() - self.pos);
+        self.fatal(message)
+    }
+
     /// Appends a diagnostic (warning or recoverable error) to the list.
     pub fn push_diagnostic(&mut self, severity: ErrorSeverity, message: String) {
         self.diagnostics.push(ParseDiagnostic {
@@ -1835,7 +1843,7 @@ pub(crate) fn parse_comment_content(input: &mut ParserInput<'_>) -> Result<Strin
                 }
             }
             None => {
-                return Err(input.fatal("unexpected end of input in comment"));
+                return Err(input.fatal_at_end("unexpected end of input in comment"));
             }
         }
     }
@@ -1877,7 +1885,7 @@ pub(crate) fn parse_cdata_content(input: &mut ParserInput<'_>) -> Result<String,
             input.advance_counting_lines(safe_len + 3); // skip content + ]]>
             Ok(content)
         }
-        None => Err(input.fatal("unexpected end of input in CDATA section")),
+        None => Err(input.fatal_at_end("unexpected end of input in CDATA section")),
     }
 }
 
@@ -1935,7 +1943,7 @@ pub(crate) fn parse_pi_content(
                 }
             }
             None => {
-                return Err(input.fatal("unexpected end of input in processing instruction"));
+                return Err(input.fatal_at_end("unexpected end of input in processing instruction"));
             }
         }
     } else {
