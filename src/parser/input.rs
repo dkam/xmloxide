@@ -876,29 +876,6 @@ impl<'a> ParserInput<'a> {
         self.pos > start
     }
 
-    /// Consumes and returns any whitespace characters at the current position.
-    ///
-    /// Returns the consumed whitespace as a `&str` (empty if no whitespace).
-    pub fn consume_whitespace(&mut self) -> &str {
-        let start = self.pos;
-        while self.pos < self.input.len() {
-            match self.input[self.pos] {
-                b'\n' => {
-                    self.line += 1;
-                    self.column = 1;
-                    self.pos += 1;
-                }
-                b' ' | b'\t' | b'\r' => {
-                    self.column += 1;
-                    self.pos += 1;
-                }
-                _ => break,
-            }
-        }
-        // Whitespace bytes are valid ASCII/UTF-8, so this conversion is safe.
-        self.str_slice(start, self.pos).unwrap_or_default()
-    }
-
     /// Skips whitespace, returning an error if none is found.
     pub fn skip_whitespace_required(&mut self) -> Result<(), ParseError> {
         if !self.skip_whitespace() {

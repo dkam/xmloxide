@@ -162,16 +162,10 @@ impl<'a> XmlParser<'a> {
 
     fn parse_misc(&mut self, parent: NodeId) -> Result<(), ParseError> {
         loop {
-            // Preserve document-level whitespace as text nodes (matches libxml2).
-            // libxml2 normalizes prolog/epilog whitespace to a single `\n`
-            // regardless of how many blank lines appear in the source.
-            let ws = self.input.consume_whitespace();
-            if !ws.is_empty() {
-                let ws_node = self.doc.create_node(NodeKind::Text {
-                    content: "\n".to_string(),
-                });
-                self.doc.append_child(parent, ws_node);
-            }
+            // Whitespace outside the root element is not part of the tree,
+            // as in libxml2 (XML 1.0 §2.8: it is `S` in `Misc`). The
+            // serializer puts each top-level node on its own line.
+            self.input.skip_whitespace();
             if self.input.at_end() {
                 break;
             }
@@ -1762,7 +1756,7 @@ mod tests {
         let input = "<?target data?><root/>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, format!("{DECL}{input}\n"));
+        assert_eq!(output, format!("{DECL}<?target data?>\n<root/>\n"));
     }
 
     #[test]
@@ -1954,11 +1948,12 @@ mod tests {
 
     #[test]
     fn test_roundtrip_doctype() {
-        // Simple DOCTYPE (no whitespace between DOCTYPE and root in input)
+        // Simple DOCTYPE. Each top-level node is on its own line, as libxml2
+        // writes it, whatever whitespace the input had between them.
         let input = "<!DOCTYPE html><html/>";
         let doc = parse(input);
         let output = crate::serial::serialize(&doc);
-        assert_eq!(output, format!("{DECL}<!DOCTYPE html><html/>\n"));
+        assert_eq!(output, format!("{DECL}<!DOCTYPE html>\n<html/>\n"));
 
         // DOCTYPE with SYSTEM
         let input = "<!DOCTYPE root SYSTEM \"root.dtd\"><root/>";
@@ -1966,7 +1961,7 @@ mod tests {
         let output = crate::serial::serialize(&doc);
         assert_eq!(
             output,
-            format!("{DECL}<!DOCTYPE root SYSTEM \"root.dtd\"><root/>\n")
+            format!("{DECL}<!DOCTYPE root SYSTEM \"root.dtd\">\n<root/>\n")
         );
 
         // DOCTYPE with PUBLIC
@@ -1978,7 +1973,7 @@ mod tests {
             output,
             format!(
                 "{DECL}<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \
-                 \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html/>\n"
+                 \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\">\n<html/>\n"
             )
         );
     }

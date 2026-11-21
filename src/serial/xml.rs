@@ -133,7 +133,8 @@ pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> Str
     // re-encoded as hex character references (matches libxml2 behavior).
     let reencode_non_ascii = doc.encoding.is_none();
 
-    // Serialize children of the document root
+    // Serialize children of the document root, each followed by a newline,
+    // as libxml2's xmlDocContentDumpOutput writes them.
     for child in doc.children(doc.root()) {
         write_node(
             doc,
@@ -144,10 +145,8 @@ pub fn serialize_with_options(doc: &Document, options: &SerializeOptions) -> Str
             0,
             false,
         );
+        output.push('\n');
     }
-
-    // Trailing newline (matches libxml2 output convention)
-    output.push('\n');
 
     output
 }
@@ -616,6 +615,16 @@ fn write_escaped_attr(out: &mut String, text: &str, reencode_non_ascii: bool) {
 mod tests {
     use super::*;
     use crate::tree::Attribute;
+
+    #[test]
+    fn test_serialize_puts_each_top_level_node_on_its_own_line() {
+        let doc = Document::parse_str("<!DOCTYPE r><!--c--><r/><?pi x?>").unwrap();
+        assert_eq!(
+            serialize(&doc),
+            "<?xml version=\"1.0\"?>\n<!DOCTYPE r>\n<!--c-->\n<r/>\n<?pi x?>\n"
+        );
+        assert_eq!(serialize(&Document::new()), "<?xml version=\"1.0\"?>\n");
+    }
 
     #[test]
     fn test_serialize_empty_element() {
