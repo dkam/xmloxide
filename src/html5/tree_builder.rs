@@ -207,6 +207,9 @@ fn determine_quirks_mode(
 // Namespace
 // ---------------------------------------------------------------------------
 
+/// The `XLink` namespace, of the `xlink:` attributes on foreign elements.
+const XLINK_NAMESPACE: &str = "http://www.w3.org/1999/xlink";
+
 /// The namespace of an element in the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Namespace {
@@ -557,23 +560,29 @@ pub fn parse_html5_full_with_options(input: &str, options: &Html5ParseOptions) -
 /// Finds the line and column of byte offsets in a text.
 struct LineIndex<'a> {
     text: &'a str,
-    /// Byte offset at which each line starts.
-    line_starts: Vec<usize>,
+    /// Byte offset at which each line starts, found when first needed: a
+    /// parse without errors needn't scan its input again.
+    line_starts: std::cell::OnceCell<Vec<usize>>,
 }
 
 impl<'a> LineIndex<'a> {
     fn new(text: &'a str) -> Self {
-        let line_starts = std::iter::once(0)
-            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
-            .collect();
-        Self { text, line_starts }
+        Self {
+            text,
+            line_starts: std::cell::OnceCell::new(),
+        }
     }
 
     /// The 1-based line and column (in characters) of `offset`.
     fn location(&self, offset: usize) -> SourceLocation {
+        let line_starts = self.line_starts.get_or_init(|| {
+            std::iter::once(0)
+                .chain(self.text.match_indices('\n').map(|(i, _)| i + 1))
+                .collect()
+        });
         let offset = offset.min(self.text.len());
-        let line = self.line_starts.partition_point(|&start| start <= offset);
-        let start = self.line_starts[line - 1];
+        let line = line_starts.partition_point(|&start| start <= offset);
+        let start = line_starts[line - 1];
         let column = self
             .text
             .get(start..offset)
@@ -974,7 +983,7 @@ fn parse_foreign_attr(name: &str) -> (Option<&str>, &str, Option<&str>) {
         "xlink:actuate" | "xlink:arcrole" | "xlink:href" | "xlink:role" | "xlink:show"
         | "xlink:title" | "xlink:type" => {
             let local = &name[6..]; // skip "xlink:"
-            (Some("xlink"), local, Some("http://www.w3.org/1999/xlink"))
+            (Some("xlink"), local, Some(XLINK_NAMESPACE))
         }
         "xml:lang" | "xml:space" => {
             let local = &name[4..]; // skip "xml:"
@@ -1375,7 +1384,6 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     /// Processes a token from the tokenizer. Afterwards, a start tag's
     /// self-closing flag must have been acknowledged, or it is an error.
     fn process_next_token(&mut self, token: Token) {
@@ -1387,30 +1395,37 @@ impl<'a> TreeBuilder<'a> {
             }
         );
         self.self_closing_acknowledged = false;
-        self.current_token = Self::error_token(&token);
+        // Copying a tag's name for errors is wasted once none are recorded.
+        if !self.error_limit_reached() {
+            self.current_token = Self::error_token(&token);
+        }
         self.process_token(token);
         if self_closing && !self.self_closing_acknowledged {
-            self.record_error(Html5ErrorKind::Code(
-                "non-void-html-element-start-tag-with-trailing-solidus",
-            ));
+            self.record_error_at(
+                Html5ErrorKind::Code("non-void-html-element-start-tag-with-trailing-solidus"),
+                self.tokenizer.token_start(),
+            );
         }
     }
 
-    /// Acknowledges the current start tag's self-closing flag, as the
-    /// specification does for elements that can't have content.
-    fn acknowledge_self_closing(&mut self) {
+    /// Pops the element just inserted for the current start tag, which
+    /// can't have content, acknowledging the tag's self-closing flag.
+    fn pop_acknowledged(&mut self) {
+        self.open_elements.pop();
         self.self_closing_acknowledged = true;
     }
 
-    /// Whether as many errors as `max_errors` allows have been recorded.
-    fn error_limit_reached(&self) -> bool {
-        self.max_errors
-            .is_some_and(|max| self.errors.len() + self.tokenizer.errors().len() >= max)
+    /// Inserts a void HTML element: pushed, popped, its start tag's
+    /// self-closing flag acknowledged.
+    fn insert_void_element(&mut self, name: &str, attrs: &[tokenizer::Attribute]) {
+        self.insert_html_element(name, attrs);
+        self.pop_acknowledged();
     }
 
-    /// Records an error on the token being processed.
-    fn record_error(&mut self, kind: Html5ErrorKind) {
-        self.record_error_at(kind, self.tokenizer.token_start());
+    /// Whether as many tree construction errors as `max_errors` allows have
+    /// been recorded. (The tokenizer caps its own; the merge is truncated.)
+    fn error_limit_reached(&self) -> bool {
+        self.max_errors.is_some_and(|max| self.errors.len() >= max)
     }
 
     fn record_error_at(&mut self, kind: Html5ErrorKind, offset: usize) {
@@ -1438,7 +1453,9 @@ impl<'a> TreeBuilder<'a> {
 
     /// A tree construction parse error on the token being processed.
     fn error(&mut self) {
-        self.error_at(self.current_token.clone(), self.tokenizer.token_start());
+        if !self.error_limit_reached() {
+            self.error_at(self.current_token.clone(), self.tokenizer.token_start());
+        }
     }
 
     /// A tree construction parse error on `token`, which began at `offset`.
@@ -1594,12 +1611,7 @@ impl<'a> TreeBuilder<'a> {
                         break;
                     }
                     // In fragment mode, don't pop the context element.
-                    if self.open_elements.len() <= 2
-                        && self
-                            .fragment_context
-                            .as_ref()
-                            .is_some_and(|(_, ns)| *ns != Namespace::Html)
-                    {
+                    if self.open_elements.len() <= 2 && self.has_foreign_context() {
                         break;
                     }
                     self.open_elements.pop();
@@ -1644,8 +1656,7 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_foreign_element(&adjusted_name, &adjusted_attrs, ns);
 
                 if self_closing {
-                    self.open_elements.pop();
-                    self.acknowledge_self_closing();
+                    self.pop_acknowledged();
                 }
             }
             Token::EndTag { ref name } if name == "br" || name == "p" => {
@@ -1654,15 +1665,7 @@ impl<'a> TreeBuilder<'a> {
                 // HTML integration point; then reprocess as "in body".
                 // In fragment mode, never pop below the context element.
                 self.error();
-                let min_stack = if self
-                    .fragment_context
-                    .as_ref()
-                    .is_some_and(|(_, ns)| *ns != Namespace::Html)
-                {
-                    2
-                } else {
-                    1
-                };
+                let min_stack = if self.has_foreign_context() { 2 } else { 1 };
                 while self.open_elements.len() > min_stack {
                     let Some(top) = self.open_elements.last() else {
                         break;
@@ -1700,11 +1703,7 @@ impl<'a> TreeBuilder<'a> {
         // (html element, or html + context element for foreign contexts).
         let min_idx = if self.fragment_context.is_some() {
             // html is at 0; for foreign contexts the context element is at 1.
-            if self
-                .fragment_context
-                .as_ref()
-                .is_some_and(|(_, ns)| *ns != Namespace::Html)
-            {
+            if self.has_foreign_context() {
                 2
             } else {
                 1
@@ -1783,18 +1782,10 @@ impl<'a> TreeBuilder<'a> {
         // puts the element in.
         let declares =
             |name: &str, uri: &str| attrs.iter().any(|a| a.name == name && a.value != uri);
-        let html_uri = "http://www.w3.org/1999/xhtml";
-        if declares(
-            "xmlns",
-            if ns == Namespace::Html {
-                html_uri
-            } else {
-                ns.uri()
-            },
-        ) {
+        if declares("xmlns", ns.uri()) {
             self.error();
         }
-        if declares("xmlns:xlink", "http://www.w3.org/1999/xlink") {
+        if declares("xmlns:xlink", XLINK_NAMESPACE) {
             self.error();
         }
         let tree_attrs: Vec<crate::tree::Attribute> = attrs
@@ -2175,13 +2166,19 @@ impl<'a> TreeBuilder<'a> {
     }
 
     fn close_p_element(&mut self) {
-        self.generate_implied_end_tags(Some("p"));
-        if !self.current_node_is_html("p") {
+        self.close_element("p", Some("p"));
+    }
+
+    /// Generates implied end tags (but for `except`), then pops elements
+    /// until the HTML element `name` is popped: a parse error if `name`
+    /// wasn't the current node by then.
+    fn close_element(&mut self, name: &str, except: Option<&str>) {
+        self.generate_implied_end_tags(except);
+        if !self.current_node_is_html(name) {
             self.error();
         }
-        // Pop until p
-        while let Some(entry) = self.open_elements.pop() {
-            if entry.name == "p" {
+        while let Some(e) = self.open_elements.pop() {
+            if e.name == name && e.ns == Namespace::Html {
                 break;
             }
         }
@@ -2725,9 +2722,7 @@ impl<'a> TreeBuilder<'a> {
                     name, attributes, ..
                 } = token
                 {
-                    self.insert_html_element(&name, &attributes);
-                    self.open_elements.pop(); // void
-                    self.acknowledge_self_closing();
+                    self.insert_void_element(&name, &attributes);
                 }
             }
             Token::StartTag { ref name, .. } if name == "title" => {
@@ -3190,15 +3185,7 @@ impl<'a> TreeBuilder<'a> {
                 for i in (0..self.open_elements.len()).rev() {
                     let entry_name = self.open_elements[i].name.clone();
                     if entry_name == "li" {
-                        self.generate_implied_end_tags(Some("li"));
-                        if !self.current_node_is_html("li") {
-                            self.error();
-                        }
-                        while let Some(e) = self.open_elements.pop() {
-                            if e.name == "li" {
-                                break;
-                            }
-                        }
+                        self.close_element("li", Some("li"));
                         break;
                     }
                     if is_special_element_ns(&entry_name, self.open_elements[i].ns)
@@ -3222,15 +3209,7 @@ impl<'a> TreeBuilder<'a> {
                 for i in (0..self.open_elements.len()).rev() {
                     let entry_name = self.open_elements[i].name.clone();
                     if matches!(entry_name.as_str(), "dd" | "dt") {
-                        self.generate_implied_end_tags(Some(&entry_name));
-                        if !self.current_node_is_html(&entry_name) {
-                            self.error();
-                        }
-                        while let Some(e) = self.open_elements.pop() {
-                            if e.name == entry_name {
-                                break;
-                            }
-                        }
+                        self.close_element(&entry_name, Some(&entry_name));
                         break;
                     }
                     if is_special_element_ns(&entry_name, self.open_elements[i].ns)
@@ -3314,15 +3293,7 @@ impl<'a> TreeBuilder<'a> {
             {
                 if let Token::EndTag { name } = token {
                     if self.element_in_scope(&name) {
-                        self.generate_implied_end_tags(None);
-                        if !self.current_node_is_html(&name) {
-                            self.error();
-                        }
-                        while let Some(e) = self.open_elements.pop() {
-                            if e.name == name {
-                                break;
-                            }
-                        }
+                        self.close_element(&name, None);
                     } else {
                         self.error();
                     }
@@ -3346,15 +3317,7 @@ impl<'a> TreeBuilder<'a> {
                         _ => self.error(),
                     }
                 } else if self.element_in_scope("form") {
-                    self.generate_implied_end_tags(None);
-                    if !self.current_node_is_html("form") {
-                        self.error();
-                    }
-                    while let Some(e) = self.open_elements.pop() {
-                        if e.name == "form" {
-                            break;
-                        }
-                    }
+                    self.close_element("form", None);
                 } else {
                     self.error();
                 }
@@ -3368,15 +3331,7 @@ impl<'a> TreeBuilder<'a> {
             }
             Token::EndTag { ref name } if name == "li" => {
                 if self.element_in_list_item_scope("li") {
-                    self.generate_implied_end_tags(Some("li"));
-                    if !self.current_node_is_html("li") {
-                        self.error();
-                    }
-                    while let Some(e) = self.open_elements.pop() {
-                        if e.name == "li" {
-                            break;
-                        }
-                    }
+                    self.close_element("li", Some("li"));
                 } else {
                     self.error();
                 }
@@ -3384,15 +3339,7 @@ impl<'a> TreeBuilder<'a> {
             Token::EndTag { ref name } if matches!(name.as_str(), "dd" | "dt") => {
                 if let Token::EndTag { name } = token {
                     if self.element_in_scope(&name) {
-                        self.generate_implied_end_tags(Some(&name));
-                        if !self.current_node_is_html(&name) {
-                            self.error();
-                        }
-                        while let Some(e) = self.open_elements.pop() {
-                            if e.name == name {
-                                break;
-                            }
-                        }
+                        self.close_element(&name, Some(&name));
                     } else {
                         self.error();
                     }
@@ -3535,15 +3482,7 @@ impl<'a> TreeBuilder<'a> {
             {
                 if let Token::EndTag { name } = token {
                     if self.element_in_scope(&name) {
-                        self.generate_implied_end_tags(None);
-                        if !self.current_node_is_html(&name) {
-                            self.error();
-                        }
-                        while let Some(e) = self.open_elements.pop() {
-                            if e.name == name {
-                                break;
-                            }
-                        }
+                        self.close_element(&name, None);
                         self.clear_formatting_to_marker();
                     } else {
                         self.error();
@@ -3582,9 +3521,7 @@ impl<'a> TreeBuilder<'a> {
                     name, attributes, ..
                 } = token
                 {
-                    self.insert_html_element(&name, &attributes);
-                    self.open_elements.pop(); // void
-                    self.acknowledge_self_closing();
+                    self.insert_void_element(&name, &attributes);
                     self.frameset_ok = false;
                 }
             }
@@ -3597,9 +3534,7 @@ impl<'a> TreeBuilder<'a> {
                     let is_hidden = attributes
                         .iter()
                         .any(|a| a.name == "type" && a.value.eq_ignore_ascii_case("hidden"));
-                    self.insert_html_element(&name, &attributes);
-                    self.open_elements.pop(); // void
-                    self.acknowledge_self_closing();
+                    self.insert_void_element(&name, &attributes);
                     if !is_hidden {
                         self.frameset_ok = false;
                     }
@@ -3612,9 +3547,7 @@ impl<'a> TreeBuilder<'a> {
                     name, attributes, ..
                 } = token
                 {
-                    self.insert_html_element(&name, &attributes);
-                    self.open_elements.pop(); // void
-                    self.acknowledge_self_closing();
+                    self.insert_void_element(&name, &attributes);
                 }
             }
             Token::StartTag { ref name, .. } if name == "hr" => {
@@ -3625,9 +3558,7 @@ impl<'a> TreeBuilder<'a> {
                     name, attributes, ..
                 } = token
                 {
-                    self.insert_html_element(&name, &attributes);
-                    self.open_elements.pop(); // void
-                    self.acknowledge_self_closing();
+                    self.insert_void_element(&name, &attributes);
                     self.frameset_ok = false;
                 }
             }
@@ -3636,9 +3567,7 @@ impl<'a> TreeBuilder<'a> {
                 self.error();
                 self.reconstruct_formatting();
                 if let Token::StartTag { attributes, .. } = token {
-                    self.insert_html_element("img", &attributes);
-                    self.open_elements.pop();
-                    self.acknowledge_self_closing();
+                    self.insert_void_element("img", &attributes);
                     self.frameset_ok = false;
                 }
             }
@@ -3775,8 +3704,7 @@ impl<'a> TreeBuilder<'a> {
                         .collect();
                     self.insert_foreign_element("math", &adjusted, Namespace::MathMl);
                     if self_closing {
-                        self.open_elements.pop();
-                        self.acknowledge_self_closing();
+                        self.pop_acknowledged();
                     }
                 }
             }
@@ -3799,8 +3727,7 @@ impl<'a> TreeBuilder<'a> {
                         .collect();
                     self.insert_foreign_element("svg", &adjusted, Namespace::Svg);
                     if self_closing {
-                        self.open_elements.pop();
-                        self.acknowledge_self_closing();
+                        self.pop_acknowledged();
                     }
                 }
             }
@@ -3999,9 +3926,7 @@ impl<'a> TreeBuilder<'a> {
                             name, attributes, ..
                         } = token
                         {
-                            self.insert_html_element(&name, &attributes);
-                            self.open_elements.pop();
-                            self.acknowledge_self_closing();
+                            self.insert_void_element(&name, &attributes);
                         }
                     } else {
                         self.foster_parenting = true;
@@ -4143,9 +4068,7 @@ impl<'a> TreeBuilder<'a> {
                     name, attributes, ..
                 } = token
                 {
-                    self.insert_html_element(&name, &attributes);
-                    self.open_elements.pop(); // void
-                    self.acknowledge_self_closing();
+                    self.insert_void_element(&name, &attributes);
                 }
             }
             Token::EndTag { ref name } if name == "colgroup" => {
@@ -4336,15 +4259,7 @@ impl<'a> TreeBuilder<'a> {
             Token::EndTag { ref name } if matches!(name.as_str(), "td" | "th") => {
                 if let Token::EndTag { name } = token {
                     if self.element_in_table_scope(&name) {
-                        self.generate_implied_end_tags(None);
-                        if !self.current_node_is_html(&name) {
-                            self.error();
-                        }
-                        while let Some(e) = self.open_elements.pop() {
-                            if e.name == name && e.ns == Namespace::Html {
-                                break;
-                            }
-                        }
+                        self.close_element(&name, None);
                         self.clear_formatting_to_marker();
                         self.mode = InsertionMode::InRow;
                     } else {
@@ -4407,15 +4322,7 @@ impl<'a> TreeBuilder<'a> {
             self.error();
             return false;
         }
-        self.generate_implied_end_tags(None);
-        if !self.current_node_is_html("caption") {
-            self.error();
-        }
-        while let Some(e) = self.open_elements.pop() {
-            if e.name == "caption" {
-                break;
-            }
-        }
+        self.close_element("caption", None);
         self.clear_formatting_to_marker();
         self.mode = InsertionMode::InTable;
         true
@@ -4485,9 +4392,7 @@ impl<'a> TreeBuilder<'a> {
                     name, attributes, ..
                 } = token
                 {
-                    self.insert_html_element(&name, &attributes);
-                    self.open_elements.pop(); // void
-                    self.acknowledge_self_closing();
+                    self.insert_void_element(&name, &attributes);
                 }
             }
             Token::EndTag { ref name } if name == "optgroup" => {
@@ -4609,8 +4514,7 @@ impl<'a> TreeBuilder<'a> {
                         .collect();
                     self.insert_foreign_element("svg", &adjusted, Namespace::Svg);
                     if self_closing {
-                        self.open_elements.pop();
-                        self.acknowledge_self_closing();
+                        self.pop_acknowledged();
                     }
                 }
             }
@@ -4632,8 +4536,7 @@ impl<'a> TreeBuilder<'a> {
                         .collect();
                     self.insert_foreign_element("math", &adjusted, Namespace::MathMl);
                     if self_closing {
-                        self.open_elements.pop();
-                        self.acknowledge_self_closing();
+                        self.pop_acknowledged();
                     }
                 }
             }
@@ -4859,9 +4762,7 @@ impl<'a> TreeBuilder<'a> {
                     name, attributes, ..
                 } = token
                 {
-                    self.insert_html_element(&name, &attributes);
-                    self.open_elements.pop(); // void
-                    self.acknowledge_self_closing();
+                    self.insert_void_element(&name, &attributes);
                 }
             }
             Token::StartTag { ref name, .. } if name == "noframes" => {

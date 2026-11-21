@@ -200,6 +200,8 @@ pub struct Tokenizer<'a> {
     // Whether the adjusted current node is in a foreign (non-HTML) namespace.
     // Set by the tree builder; controls CDATA section handling.
     allow_cdata: bool,
+    // Whether the current attribute's name is one the tag already has.
+    current_attr_duplicate: bool,
     // Most attributes a tag may have, and whether a tag has had more.
     max_attributes: Option<usize>,
     // Most errors to record.
@@ -249,6 +251,7 @@ impl<'a> Tokenizer<'a> {
             last_start_tag_name: None,
             char_ref_code: 0,
             allow_cdata: false,
+            current_attr_duplicate: false,
             max_attributes: None,
             max_errors: None,
             attribute_limit_exceeded: false,
@@ -335,11 +338,8 @@ impl<'a> Tokenizer<'a> {
     /// Returns [`Token::Eof`] when the input is exhausted.
     #[allow(clippy::too_many_lines)]
     pub fn next_token(&mut self) -> Token {
-        // Drain pending queue first (character reference expansions, etc.)
-        if let Some((tok, start)) = self.pending_tokens.pop_front() {
-            self.token_start = start;
-            return tok;
-        }
+        // Tokens produced from here on begin here. Queued ones (character
+        // reference expansions, etc.) come first, with their own starts.
         self.pending_start = self.pos;
         loop {
             if let Some((tok, start)) = self.pending_tokens.pop_front() {
@@ -537,13 +537,15 @@ impl<'a> Tokenizer<'a> {
 
     /// Push a parse error, at the character the tokenizer is looking at.
     fn emit_error(&mut self, code: &'static str) {
+        self.emit_error_at(code, self.char_start);
+    }
+
+    /// Push a parse error at byte offset `span`.
+    fn emit_error_at(&mut self, code: &'static str, span: usize) {
         if self.max_errors.is_some_and(|max| self.errors.len() >= max) {
             return;
         }
-        self.errors.push(TokenizerError {
-            code,
-            span: self.char_start,
-        });
+        self.errors.push(TokenizerError { code, span });
     }
 
     /// Queues a token, which began where the tokenizer started producing it.
@@ -594,6 +596,15 @@ impl<'a> Tokenizer<'a> {
         self.current_tag_self_closing = false;
     }
 
+    /// Gives up on the DOCTYPE at `c`, a parse error `code`: it is in quirks
+    /// mode, and the bogus DOCTYPE state reconsumes `c`.
+    fn give_up_on_doctype(&mut self, code: &'static str, c: char) {
+        self.emit_error(code);
+        self.current_doctype_force_quirks = true;
+        self.reconsume(c);
+        self.state = State::BogusDoctype;
+    }
+
     /// Emit the current DOCTYPE token.
     fn emit_doctype(&mut self) {
         let token = Token::Doctype {
@@ -629,6 +640,7 @@ impl<'a> Tokenizer<'a> {
     /// Start a new attribute on the current tag.
     fn start_new_attr(&mut self) {
         self.finish_current_attr();
+        self.current_attr_duplicate = false;
         self.current_attr_name.clear();
         self.current_attr_value.clear();
     }
@@ -648,8 +660,9 @@ impl<'a> Tokenizer<'a> {
             self.attribute_limit_exceeded = true;
             return;
         }
-        // The spec says duplicate attributes are parse errors; keep first.
-        if !self.current_tag_attrs.iter().any(|a| a.name == name) {
+        // A duplicate (reported on leaving its name) is dropped: the first
+        // stays.
+        if !self.current_attr_duplicate {
             self.current_tag_attrs.push(Attribute { name, value });
         }
     }
@@ -683,7 +696,7 @@ impl<'a> Tokenizer<'a> {
         } else {
             // Emit each char individually.
             for ch in buf.chars() {
-                self.queue(Token::Character(ch));
+                self.emit_char(ch);
             }
         }
     }
@@ -1578,11 +1591,11 @@ impl<'a> Tokenizer<'a> {
     /// one already on the tag is a parse error (WHATWG 13.2.5.33). It is
     /// dropped when the attribute is finished.
     fn leave_attribute_name(&mut self) {
-        if self
+        self.current_attr_duplicate = self
             .current_tag_attrs
             .iter()
-            .any(|a| a.name == self.current_attr_name)
-        {
+            .any(|a| a.name == self.current_attr_name);
+        if self.current_attr_duplicate {
             self.emit_error("duplicate-attribute");
         }
     }
@@ -2231,9 +2244,8 @@ impl<'a> Tokenizer<'a> {
                     self.state = State::AfterDoctypeSystemKeyword;
                 } else {
                     // Reported at the character, which the bogus DOCTYPE
-                    // state then reconsumes.
-                    self.char_start = self.pos;
-                    self.emit_error("invalid-character-sequence-after-doctype-name");
+                    // state then consumes.
+                    self.emit_error_at("invalid-character-sequence-after-doctype-name", self.pos);
                     self.current_doctype_force_quirks = true;
                     self.state = State::BogusDoctype;
                 }
@@ -2270,10 +2282,7 @@ impl<'a> Tokenizer<'a> {
                 self.emit_eof();
             }
             Some(c) => {
-                self.emit_error("missing-quote-before-doctype-public-identifier");
-                self.current_doctype_force_quirks = true;
-                self.reconsume(c);
-                self.state = State::BogusDoctype;
+                self.give_up_on_doctype("missing-quote-before-doctype-public-identifier", c);
             }
         }
     }
@@ -2305,10 +2314,7 @@ impl<'a> Tokenizer<'a> {
                 self.emit_eof();
             }
             Some(c) => {
-                self.emit_error("missing-quote-before-doctype-public-identifier");
-                self.current_doctype_force_quirks = true;
-                self.reconsume(c);
-                self.state = State::BogusDoctype;
+                self.give_up_on_doctype("missing-quote-before-doctype-public-identifier", c);
             }
         }
     }
@@ -2404,10 +2410,7 @@ impl<'a> Tokenizer<'a> {
                 self.emit_eof();
             }
             Some(c) => {
-                self.emit_error("missing-quote-before-doctype-system-identifier");
-                self.current_doctype_force_quirks = true;
-                self.reconsume(c);
-                self.state = State::BogusDoctype;
+                self.give_up_on_doctype("missing-quote-before-doctype-system-identifier", c);
             }
         }
     }
@@ -2437,10 +2440,7 @@ impl<'a> Tokenizer<'a> {
                 self.emit_eof();
             }
             Some(c) => {
-                self.emit_error("missing-quote-before-doctype-system-identifier");
-                self.current_doctype_force_quirks = true;
-                self.reconsume(c);
-                self.state = State::BogusDoctype;
+                self.give_up_on_doctype("missing-quote-before-doctype-system-identifier", c);
             }
         }
     }
@@ -2474,10 +2474,7 @@ impl<'a> Tokenizer<'a> {
                 self.emit_eof();
             }
             Some(c) => {
-                self.emit_error("missing-quote-before-doctype-system-identifier");
-                self.current_doctype_force_quirks = true;
-                self.reconsume(c);
-                self.state = State::BogusDoctype;
+                self.give_up_on_doctype("missing-quote-before-doctype-system-identifier", c);
             }
         }
     }
@@ -2509,10 +2506,7 @@ impl<'a> Tokenizer<'a> {
                 self.emit_eof();
             }
             Some(c) => {
-                self.emit_error("missing-quote-before-doctype-system-identifier");
-                self.current_doctype_force_quirks = true;
-                self.reconsume(c);
-                self.state = State::BogusDoctype;
+                self.give_up_on_doctype("missing-quote-before-doctype-system-identifier", c);
             }
         }
     }
@@ -2754,8 +2748,7 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
                 // Reported at the character after the reference.
-                self.char_start = self.pos;
-                self.emit_error("missing-semicolon-after-character-reference");
+                self.emit_error_at("missing-semicolon-after-character-reference", self.pos);
             }
 
             self.temp_buffer.clear();
