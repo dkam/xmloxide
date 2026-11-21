@@ -1205,6 +1205,21 @@ impl<'a> TreeBuilder<'a> {
             .is_some_and(|(_, ns)| *ns != Namespace::Html)
     }
 
+    /// The open elements but a foreign fragment context element: those the
+    /// input opened, as the specification has them on the stack.
+    fn elements_opened(&self) -> impl Iterator<Item = &StackEntry> {
+        let context = if self.has_foreign_context() {
+            1
+        } else {
+            usize::MAX
+        };
+        self.open_elements
+            .iter()
+            .enumerate()
+            .filter(move |&(i, _)| i != context)
+            .map(|(_, e)| e)
+    }
+
     /// Checks the limits, as Gumbo does before each token, and records the
     /// one the input has exceeded. Parsing stops there.
     fn stop_at_limit(&mut self) -> bool {
@@ -1467,7 +1482,7 @@ impl<'a> TreeBuilder<'a> {
         let kind = Html5ErrorKind::TreeConstruction {
             token,
             before_doctype: self.mode == InsertionMode::Initial,
-            open_elements: self.open_elements.iter().map(|e| e.name.clone()).collect(),
+            open_elements: self.elements_opened().map(|e| e.name.clone()).collect(),
         };
         self.record_error_at(kind, offset);
     }
@@ -1847,36 +1862,28 @@ impl<'a> TreeBuilder<'a> {
     /// Whether an element other than those the end of the body may leave
     /// open is open (the spec's check on EOF, `</body>` and `</html>`).
     fn has_unclosed_element(&self) -> bool {
-        // A foreign fragment context element isn't an element the input
-        // opened.
-        let skip = if self.has_foreign_context() {
-            1
-        } else {
-            usize::MAX
-        };
-        self.open_elements.iter().enumerate().any(|(i, e)| {
-            i != skip
-                && (e.ns != Namespace::Html
-                    || !matches!(
-                        e.name.as_str(),
-                        "dd" | "dt"
-                            | "li"
-                            | "optgroup"
-                            | "option"
-                            | "p"
-                            | "rb"
-                            | "rp"
-                            | "rt"
-                            | "rtc"
-                            | "tbody"
-                            | "td"
-                            | "tfoot"
-                            | "th"
-                            | "thead"
-                            | "tr"
-                            | "body"
-                            | "html"
-                    ))
+        self.elements_opened().any(|e| {
+            e.ns != Namespace::Html
+                || !matches!(
+                    e.name.as_str(),
+                    "dd" | "dt"
+                        | "li"
+                        | "optgroup"
+                        | "option"
+                        | "p"
+                        | "rb"
+                        | "rp"
+                        | "rt"
+                        | "rtc"
+                        | "tbody"
+                        | "td"
+                        | "tfoot"
+                        | "th"
+                        | "thead"
+                        | "tr"
+                        | "body"
+                        | "html"
+                )
         })
     }
 
@@ -5470,5 +5477,27 @@ mod tests {
             errors,
             vec![(character(), 23), (character(), 24), (character(), 25)]
         );
+    }
+
+    #[test]
+    fn test_errors_in_a_foreign_fragment_list_the_elements_the_input_opened() {
+        // The context element isn't open (WHATWG 13.4), though this parser
+        // keeps it on the stack.
+        let options = Html5ParseOptions {
+            fragment_context: Some("svg svg".to_string()),
+            ..Default::default()
+        };
+        let result = parse_with("<g></x>", &options);
+        let stacks: Vec<Vec<&str>> = result
+            .error_details
+            .iter()
+            .filter_map(|e| match &e.kind {
+                Html5ErrorKind::TreeConstruction { open_elements, .. } => {
+                    Some(open_elements.iter().map(String::as_str).collect())
+                }
+                Html5ErrorKind::Code(_) => None,
+            })
+            .collect();
+        assert_eq!(stacks, vec![vec!["html", "g"], vec!["html", "g"]]);
     }
 }
