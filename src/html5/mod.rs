@@ -81,5 +81,6 @@ pub(crate) mod tree_builder;
 
 pub use tree_builder::{
     doctype_quirks_mode, parse_html5, parse_html5_full, parse_html5_full_with_options,
-    parse_html5_with_options, Html5Limit, Html5ParseOptions, Html5ParseResult, QuirksMode,
+    parse_html5_with_options, Html5Error, Html5ErrorKind, Html5ErrorToken, Html5Limit,
+    Html5ParseOptions, Html5ParseResult, QuirksMode,
 };

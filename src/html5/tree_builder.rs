@@ -243,11 +243,88 @@ enum FormatEntry {
 // Tree build error
 // ---------------------------------------------------------------------------
 
-/// An error encountered during tree construction.
+/// The token a tree construction error was raised on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Html5ErrorToken {
+    /// A DOCTYPE.
+    Doctype,
+    /// A start tag, by name.
+    StartTag(String),
+    /// An end tag, by name.
+    EndTag(String),
+    /// A character; `'\0'` for a NULL character.
+    Character(char),
+    /// A comment.
+    Comment,
+    /// The end of the input.
+    EndOfFile,
+}
+
+/// What kind of parse error an [`Html5Error`] is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Html5ErrorKind {
+    /// An error the WHATWG specification names, by its code (for instance
+    /// `"eof-in-tag"`). These are tokenizer errors, plus
+    /// `"non-void-html-element-start-tag-with-trailing-solidus"`, which only
+    /// tree construction can detect.
+    Code(&'static str),
+    /// A tree construction error: `token` was not expected where it appeared.
+    /// The specification gives these no codes.
+    TreeConstruction {
+        /// The token that caused the error.
+        token: Html5ErrorToken,
+        /// Whether the parser was still waiting for a DOCTYPE (the "initial"
+        /// insertion mode).
+        before_doctype: bool,
+        /// The names of the open elements, outermost first.
+        open_elements: Vec<String>,
+    },
+}
+
+/// A parse error with what the parser knew when it found it.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct TreeBuildError {
-    message: String,
+pub struct Html5Error {
+    /// What went wrong.
+    pub kind: Html5ErrorKind,
+    /// Where: for tree construction errors, the start of the token. Byte
+    /// offsets are into the input with its newlines normalized (CR and CRLF
+    /// to LF), as the tokenizer reads it.
+    pub location: SourceLocation,
+}
+
+impl Html5Error {
+    /// A one-line description: the code, or the unexpected token.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match &self.kind {
+            Html5ErrorKind::Code(code) => (*code).to_string(),
+            Html5ErrorKind::TreeConstruction {
+                before_doctype: true,
+                token,
+                ..
+            } if *token != Html5ErrorToken::Doctype => "expected a DOCTYPE".to_string(),
+            Html5ErrorKind::TreeConstruction { token, .. } => match token {
+                Html5ErrorToken::Doctype => "unexpected DOCTYPE".to_string(),
+                Html5ErrorToken::StartTag(name) => format!("unexpected start tag <{name}>"),
+                Html5ErrorToken::EndTag(name) => format!("unexpected end tag </{name}>"),
+                Html5ErrorToken::Character('\0') => "unexpected NULL character".to_string(),
+                Html5ErrorToken::Character(_) => "unexpected character".to_string(),
+                Html5ErrorToken::Comment => "unexpected comment".to_string(),
+                Html5ErrorToken::EndOfFile => "unexpected end of file".to_string(),
+            },
+        }
+    }
+}
+
+/// An error tree construction found, before its position is resolved.
+#[derive(Debug, Clone)]
+struct TreeError {
+    kind: Html5ErrorKind,
+    /// Byte offset of the token's start in the normalized input.
+    offset: usize,
+    /// How many tokenizer errors came before it, so the two lists can be
+    /// merged in the order the errors occurred.
+    tokenizer_errors: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +407,11 @@ pub struct Html5ParseResult {
     /// Parse errors encountered during tokenization and tree construction.
     ///
     /// These are non-fatal diagnostics — the document tree is still complete.
+    /// They are in the order they occurred.
     pub errors: Vec<ParseDiagnostic>,
+    /// The same errors, in the same order, with what the parser knew about
+    /// each.
+    pub error_details: Vec<Html5Error>,
     /// The document's compatibility mode, as its DOCTYPE determined it.
     pub quirks_mode: QuirksMode,
     /// The limit that stopped the parse early, if one did. The document is
@@ -414,59 +495,79 @@ pub fn parse_html5_full_with_options(input: &str, options: &Html5ParseOptions) -
     let mut builder = TreeBuilder::new(tokenizer, options);
     builder.run();
 
-    // Collect tokenizer errors as diagnostics.
-    let mut errors: Vec<ParseDiagnostic> = builder
-        .tokenizer
-        .errors()
-        .iter()
-        .map(|e| {
-            // Compute line/column from byte offset.
-            let (line, col) = byte_offset_to_line_col(input, e.span);
-            ParseDiagnostic {
-                severity: ErrorSeverity::Error,
-                message: e.code.to_string(),
-                location: SourceLocation {
-                    line,
-                    column: col,
-                    byte_offset: e.span,
-                },
-            }
-        })
-        .collect();
-
-    // Append tree construction errors.
-    for e in &builder.errors {
-        errors.push(ParseDiagnostic {
-            severity: ErrorSeverity::Error,
-            message: e.message.clone(),
-            location: SourceLocation::default(),
+    // Merge the tokenizer's errors with tree construction's, in the order
+    // they occurred.
+    let locate = LineIndex::new(builder.tokenizer.input());
+    let tokenizer_errors = builder.tokenizer.errors();
+    let mut error_details = Vec::with_capacity(tokenizer_errors.len() + builder.errors.len());
+    let mut next_tokenizer_error = 0;
+    let mut push_tokenizer_errors = |details: &mut Vec<Html5Error>, until: usize| {
+        while next_tokenizer_error < until.min(tokenizer_errors.len()) {
+            let error = &tokenizer_errors[next_tokenizer_error];
+            details.push(Html5Error {
+                kind: Html5ErrorKind::Code(error.code),
+                location: locate.location(error.span),
+            });
+            next_tokenizer_error += 1;
+        }
+    };
+    for error in &builder.errors {
+        push_tokenizer_errors(&mut error_details, error.tokenizer_errors);
+        error_details.push(Html5Error {
+            kind: error.kind.clone(),
+            location: locate.location(error.offset),
         });
     }
+    push_tokenizer_errors(&mut error_details, usize::MAX);
+    let errors = error_details
+        .iter()
+        .map(|error| ParseDiagnostic {
+            severity: ErrorSeverity::Error,
+            message: error.message(),
+            location: error.location,
+        })
+        .collect();
 
     let limit_exceeded = builder.limit_exceeded();
     Html5ParseResult {
         document: builder.doc,
         errors,
+        error_details,
         quirks_mode: builder.quirks_mode,
         limit_exceeded,
     }
 }
 
-/// Convert a byte offset into 1-based (line, column) pair.
-fn byte_offset_to_line_col(input: &str, offset: usize) -> (u32, u32) {
-    let bytes = input.as_bytes();
-    let end = offset.min(bytes.len());
-    let mut line: u32 = 1;
-    let mut col: u32 = 1;
-    for &b in &bytes[..end] {
-        if b == b'\n' {
-            line += 1;
-            col = 1;
-        } else {
-            col += 1;
+/// Finds the line and column of byte offsets in a text.
+struct LineIndex<'a> {
+    text: &'a str,
+    /// Byte offset at which each line starts.
+    line_starts: Vec<usize>,
+}
+
+impl<'a> LineIndex<'a> {
+    fn new(text: &'a str) -> Self {
+        let line_starts = std::iter::once(0)
+            .chain(text.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        Self { text, line_starts }
+    }
+
+    /// The 1-based line and column (in characters) of `offset`.
+    fn location(&self, offset: usize) -> SourceLocation {
+        let offset = offset.min(self.text.len());
+        let line = self.line_starts.partition_point(|&start| start <= offset);
+        let start = self.line_starts[line - 1];
+        let column = self
+            .text
+            .get(start..offset)
+            .map_or(offset - start, |s| s.chars().count());
+        SourceLocation {
+            line: u32::try_from(line).unwrap_or(u32::MAX),
+            column: u32::try_from(column + 1).unwrap_or(u32::MAX),
+            byte_offset: offset,
         }
     }
-    (line, col)
 }
 
 // ---------------------------------------------------------------------------
@@ -907,8 +1008,12 @@ struct TreeBuilder<'a> {
     fragment_form_ancestor: bool,
     fragment_context_encoding: Option<String>,
     max_tree_depth: Option<usize>,
-    #[allow(dead_code)]
-    errors: Vec<TreeBuildError>,
+    /// Tree construction errors, in the order they occurred.
+    errors: Vec<TreeError>,
+    /// Whether the current start tag's self-closing flag was acknowledged.
+    self_closing_acknowledged: bool,
+    /// The token being processed, which tree construction errors name.
+    current_token: Html5ErrorToken,
 }
 
 impl<'a> TreeBuilder<'a> {
@@ -948,6 +1053,8 @@ impl<'a> TreeBuilder<'a> {
             fragment_context_encoding: options.fragment_context_encoding.clone(),
             max_tree_depth: options.max_tree_depth,
             errors: Vec::new(),
+            self_closing_acknowledged: false,
+            current_token: Html5ErrorToken::EndOfFile,
         }
     }
 
@@ -1113,6 +1220,8 @@ impl<'a> TreeBuilder<'a> {
                             if let Token::Character(c2) = next {
                                 if c2 == '\0' {
                                     // Null in body: parse error, ignored per spec.
+                                    self.current_token = Html5ErrorToken::Character('\0');
+                                    self.error();
                                 } else {
                                     if !is_ascii_whitespace(c2) {
                                         self.frameset_ok = false;
@@ -1127,7 +1236,7 @@ impl<'a> TreeBuilder<'a> {
                                     self.insert_characters(&buf);
                                 }
                                 if next == Token::Eof {
-                                    self.process_token(next);
+                                    self.process_next_token(next);
                                     self.populate_selectedcontent();
                                     return;
                                 }
@@ -1137,7 +1246,7 @@ impl<'a> TreeBuilder<'a> {
                                     .last()
                                     .is_some_and(|el| el.ns != Namespace::Html);
                                 self.tokenizer.set_allow_cdata(in_foreign_now);
-                                self.process_token(next);
+                                self.process_next_token(next);
                                 break;
                             }
                         }
@@ -1147,7 +1256,7 @@ impl<'a> TreeBuilder<'a> {
             }
 
             let is_eof = token == Token::Eof;
-            self.process_token(token);
+            self.process_next_token(token);
             if is_eof {
                 break;
             }
@@ -1233,6 +1342,62 @@ impl<'a> TreeBuilder<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
+    /// Processes a token from the tokenizer. Afterwards, a start tag's
+    /// self-closing flag must have been acknowledged, or it is an error.
+    fn process_next_token(&mut self, token: Token) {
+        let self_closing = matches!(
+            token,
+            Token::StartTag {
+                self_closing: true,
+                ..
+            }
+        );
+        self.self_closing_acknowledged = false;
+        self.current_token = Self::error_token(&token);
+        self.process_token(token);
+        if self_closing && !self.self_closing_acknowledged {
+            self.record_error(Html5ErrorKind::Code(
+                "non-void-html-element-start-tag-with-trailing-solidus",
+            ));
+        }
+    }
+
+    /// Acknowledges the current start tag's self-closing flag, as the
+    /// specification does for elements that can't have content.
+    fn acknowledge_self_closing(&mut self) {
+        self.self_closing_acknowledged = true;
+    }
+
+    fn record_error(&mut self, kind: Html5ErrorKind) {
+        self.errors.push(TreeError {
+            kind,
+            offset: self.tokenizer.token_start(),
+            tokenizer_errors: self.tokenizer.errors().len(),
+        });
+    }
+
+    /// The token tree construction errors are reported against.
+    fn error_token(token: &Token) -> Html5ErrorToken {
+        match token {
+            Token::Doctype { .. } => Html5ErrorToken::Doctype,
+            Token::StartTag { name, .. } => Html5ErrorToken::StartTag(name.clone()),
+            Token::EndTag { name } => Html5ErrorToken::EndTag(name.clone()),
+            Token::Character(c) => Html5ErrorToken::Character(*c),
+            Token::Comment(_) => Html5ErrorToken::Comment,
+            Token::Eof => Html5ErrorToken::EndOfFile,
+        }
+    }
+
+    /// A tree construction parse error on the token being processed.
+    fn error(&mut self) {
+        let kind = Html5ErrorKind::TreeConstruction {
+            token: self.current_token.clone(),
+            before_doctype: self.mode == InsertionMode::Initial,
+            open_elements: self.open_elements.iter().map(|e| e.name.clone()).collect(),
+        };
+        self.record_error(kind);
+    }
+
     fn process_token(&mut self, token: Token) {
         // Determine whether to use normal insertion mode rules or foreign content.
         // Per WHATWG §13.2.6.
@@ -1334,6 +1499,7 @@ impl<'a> TreeBuilder<'a> {
     fn handle_foreign_content(&mut self, token: Token) {
         match token {
             Token::Character('\0') => {
+                self.error();
                 self.insert_character('\u{FFFD}');
             }
             Token::Character(c) if is_ascii_whitespace(c) => {
@@ -1348,6 +1514,7 @@ impl<'a> TreeBuilder<'a> {
             }
             Token::Doctype { .. } | Token::Eof => {
                 // Parse error, ignore.
+                self.error();
             }
             Token::StartTag {
                 ref name,
@@ -1361,6 +1528,7 @@ impl<'a> TreeBuilder<'a> {
             {
                 // Parse error. Pop until MathML text integration point,
                 // HTML integration point, or HTML namespace element.
+                self.error();
                 while let Some(top) = self.open_elements.last() {
                     if top.ns == Namespace::Html
                         || Self::is_mathml_text_integration_point(top)
@@ -1420,6 +1588,7 @@ impl<'a> TreeBuilder<'a> {
 
                 if self_closing {
                     self.open_elements.pop();
+                    self.acknowledge_self_closing();
                 }
             }
             Token::EndTag { ref name } if name == "br" || name == "p" => {
@@ -1427,6 +1596,7 @@ impl<'a> TreeBuilder<'a> {
                 // HTML namespace element, MathML text integration point, or
                 // HTML integration point; then reprocess as "in body".
                 // In fragment mode, never pop below the context element.
+                self.error();
                 let min_stack = if self
                     .fragment_context
                     .as_ref()
@@ -1460,6 +1630,17 @@ impl<'a> TreeBuilder<'a> {
     fn handle_foreign_end_tag(&mut self, tag_name: &str) {
         if self.open_elements.is_empty() {
             return;
+        }
+        // The current node is the foreign fragment context element when it is
+        // the only element the fragment has open; for the specification it
+        // isn't on the stack at all, so its end tag matches nothing.
+        let at_context = self.open_elements.len() == 2
+            && self
+                .fragment_context
+                .as_ref()
+                .is_some_and(|(_, ns)| *ns != Namespace::Html);
+        if at_context || !self.current_node_name().eq_ignore_ascii_case(tag_name) {
+            self.error();
         }
 
         // In fragment parsing, never pop below the initial stack
@@ -1545,6 +1726,24 @@ impl<'a> TreeBuilder<'a> {
         attrs: &[tokenizer::Attribute],
         ns: Namespace,
     ) -> NodeId {
+        // An xmlns or xmlns:xlink attribute must match what the parser
+        // puts the element in.
+        let declares =
+            |name: &str, uri: &str| attrs.iter().any(|a| a.name == name && a.value != uri);
+        let html_uri = "http://www.w3.org/1999/xhtml";
+        if declares(
+            "xmlns",
+            if ns == Namespace::Html {
+                html_uri
+            } else {
+                ns.uri()
+            },
+        ) {
+            self.error();
+        }
+        if declares("xmlns:xlink", "http://www.w3.org/1999/xlink") {
+            self.error();
+        }
         let tree_attrs: Vec<crate::tree::Attribute> = attrs
             .iter()
             .map(|a| {
@@ -1599,6 +1798,50 @@ impl<'a> TreeBuilder<'a> {
 
     fn current_node(&self) -> Option<NodeId> {
         self.open_elements.last().map(|e| e.node_id)
+    }
+
+    /// Whether an element other than those the end of the body may leave
+    /// open is open (the spec's check on EOF, `</body>` and `</html>`).
+    fn has_unclosed_element(&self) -> bool {
+        // A foreign fragment context element sits on the stack (see
+        // `initialize_fragment`), but isn't an element the input opened.
+        let context = usize::from(
+            self.fragment_context
+                .as_ref()
+                .is_some_and(|(_, ns)| *ns != Namespace::Html),
+        );
+        let skip = if context == 1 { 1 } else { usize::MAX };
+        self.open_elements.iter().enumerate().any(|(i, e)| {
+            i != skip
+                && (e.ns != Namespace::Html
+                    || !matches!(
+                        e.name.as_str(),
+                        "dd" | "dt"
+                            | "li"
+                            | "optgroup"
+                            | "option"
+                            | "p"
+                            | "rb"
+                            | "rp"
+                            | "rt"
+                            | "rtc"
+                            | "tbody"
+                            | "td"
+                            | "tfoot"
+                            | "th"
+                            | "thead"
+                            | "tr"
+                            | "body"
+                            | "html"
+                    ))
+        })
+    }
+
+    /// Whether the current node is the HTML element `name`.
+    fn current_node_is_html(&self, name: &str) -> bool {
+        self.open_elements
+            .last()
+            .is_some_and(|e| e.ns == Namespace::Html && e.name == name)
     }
 
     fn current_node_name(&self) -> &str {
@@ -1881,6 +2124,9 @@ impl<'a> TreeBuilder<'a> {
 
     fn close_p_element(&mut self) {
         self.generate_implied_end_tags(Some("p"));
+        if !self.current_node_is_html("p") {
+            self.error();
+        }
         // Pop until p
         while let Some(entry) = self.open_elements.pop() {
             if entry.name == "p" {
@@ -2058,13 +2304,19 @@ impl<'a> TreeBuilder<'a> {
                 .iter()
                 .position(|e| e.node_id == fmt_node_id)
             else {
+                self.error();
                 self.active_formatting.remove(fmt_idx);
                 return;
             };
 
             // Step 6: If the formatting element is not in scope, return.
             if !self.element_in_scope(&fmt_name) {
+                self.error();
                 return;
+            }
+            // Step 7: not being the current node is an error, but go on.
+            if self.current_node() != Some(fmt_node_id) {
+                self.error();
             }
 
             // Step 8: Find the furthest block.
@@ -2288,6 +2540,14 @@ impl<'a> TreeBuilder<'a> {
                 force_quirks,
             } => {
                 let doctype_name = name.unwrap_or_default();
+                if doctype_name != "html"
+                    || public_id.is_some()
+                    || system_id
+                        .as_deref()
+                        .is_some_and(|id| id != "about:legacy-compat")
+                {
+                    self.error();
+                }
                 self.quirks_mode = determine_quirks_mode(
                     &doctype_name,
                     public_id.as_deref(),
@@ -2305,7 +2565,8 @@ impl<'a> TreeBuilder<'a> {
                 self.mode = InsertionMode::BeforeHtml;
             }
             _ => {
-                // Missing DOCTYPE → quirks mode.
+                // Missing DOCTYPE: parse error, and quirks mode.
+                self.error();
                 self.quirks_mode = QuirksMode::Quirks;
                 self.mode = InsertionMode::BeforeHtml;
                 self.process_token(token);
@@ -2318,7 +2579,7 @@ impl<'a> TreeBuilder<'a> {
             Token::Comment(data) => {
                 self.insert_comment_at_document(&data);
             }
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::Character(c) if is_ascii_whitespace(c) => { /* ignore */ }
             Token::StartTag { ref name, .. } if name == "html" => {
                 if let Token::StartTag {
@@ -2341,7 +2602,7 @@ impl<'a> TreeBuilder<'a> {
             Token::EndTag { ref name }
                 if !matches!(name.as_str(), "head" | "body" | "html" | "br") =>
             {
-                // Parse error, ignore
+                self.error();
             }
             _ => {
                 let node_id = self.create_element_for_token("html", &[], Namespace::Html);
@@ -2363,7 +2624,7 @@ impl<'a> TreeBuilder<'a> {
         match token {
             Token::Character(c) if is_ascii_whitespace(c) => { /* ignore */ }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
@@ -2380,7 +2641,7 @@ impl<'a> TreeBuilder<'a> {
             Token::EndTag { ref name }
                 if !matches!(name.as_str(), "head" | "body" | "html" | "br") =>
             {
-                // Parse error, ignore
+                self.error();
             }
             _ => {
                 let node_id = self.insert_html_element("head", &[]);
@@ -2398,7 +2659,7 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_character(c);
             }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
@@ -2414,6 +2675,7 @@ impl<'a> TreeBuilder<'a> {
                 {
                     self.insert_html_element(&name, &attributes);
                     self.open_elements.pop(); // void
+                    self.acknowledge_self_closing();
                 }
             }
             Token::StartTag { ref name, .. } if name == "title" => {
@@ -2489,6 +2751,9 @@ impl<'a> TreeBuilder<'a> {
                     .any(|e| e.name == "template" && e.ns == Namespace::Html)
                 {
                     self.generate_all_implied_end_tags();
+                    if !self.current_node_is_html("template") {
+                        self.error();
+                    }
                     while let Some(entry) = self.open_elements.pop() {
                         if entry.name == "template" && entry.ns == Namespace::Html {
                             break;
@@ -2497,13 +2762,15 @@ impl<'a> TreeBuilder<'a> {
                     self.clear_formatting_to_marker();
                     self.template_modes.pop();
                     self.reset_insertion_mode();
+                } else {
+                    self.error();
                 }
             }
             Token::StartTag { ref name, .. } if name == "head" => {
-                // Parse error, ignore
+                self.error();
             }
             Token::EndTag { .. } => {
-                // Parse error, ignore
+                self.error();
             }
             _ => {
                 self.open_elements.pop();
@@ -2515,7 +2782,7 @@ impl<'a> TreeBuilder<'a> {
 
     fn handle_in_head_noscript(&mut self, token: Token) {
         match token {
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
@@ -2538,12 +2805,13 @@ impl<'a> TreeBuilder<'a> {
                 self.handle_in_head(token);
             }
             Token::StartTag { ref name, .. } if matches!(name.as_str(), "head" | "noscript") => {
-                // Parse error, ignore
+                self.error();
             }
             Token::EndTag { ref name } if name != "br" => {
-                // Parse error, ignore
+                self.error();
             }
             _ => {
+                self.error();
                 self.open_elements.pop();
                 self.mode = InsertionMode::InHead;
                 self.process_token(token);
@@ -2557,7 +2825,7 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_character(c);
             }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
@@ -2595,6 +2863,7 @@ impl<'a> TreeBuilder<'a> {
                         | "title"
                 ) =>
             {
+                self.error();
                 // Push head back, process in InHead, then remove head again
                 if let Some(head) = self.head_pointer {
                     self.open_elements.push(StackEntry {
@@ -2614,10 +2883,10 @@ impl<'a> TreeBuilder<'a> {
                 self.handle_in_head(token);
             }
             Token::StartTag { ref name, .. } if name == "head" => {
-                // Parse error, ignore
+                self.error();
             }
             Token::EndTag { ref name } if !matches!(name.as_str(), "body" | "html" | "br") => {
-                // Parse error, ignore
+                self.error();
             }
             _ => {
                 self.insert_html_element("body", &[]);
@@ -2634,7 +2903,7 @@ impl<'a> TreeBuilder<'a> {
     )]
     fn handle_in_body(&mut self, token: Token) {
         match token {
-            Token::Character('\0') => { /* ignore */ }
+            Token::Character('\0') => self.error(),
             Token::Character(c) if is_ascii_whitespace(c) => {
                 self.reconstruct_formatting();
                 self.insert_character(c);
@@ -2645,10 +2914,11 @@ impl<'a> TreeBuilder<'a> {
                 self.frameset_ok = false;
             }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
-                // Merge attributes onto the existing html element — but
-                // ignore if there is a template on the stack.
+                // Parse error. Merge attributes onto the existing html
+                // element, but ignore it if there is a template on the stack.
+                self.error();
                 if !self.open_elements.iter().any(|e| e.name == "template") {
                     if let Token::StartTag { attributes, .. } = token {
                         if let Some(html_entry) = self.open_elements.first() {
@@ -2694,8 +2964,9 @@ impl<'a> TreeBuilder<'a> {
                 self.handle_in_head(token);
             }
             Token::StartTag { ref name, .. } if name == "body" => {
-                // Merge attributes onto existing body — but ignore if there
-                // is a template element on the stack of open elements.
+                // Parse error. Merge attributes onto existing body, but
+                // ignore it if there is a template element on the stack.
+                self.error();
                 if let Token::StartTag { attributes, .. } = token {
                     if self.open_elements.len() >= 2
                         && self.open_elements[1].name == "body"
@@ -2723,7 +2994,8 @@ impl<'a> TreeBuilder<'a> {
                 }
             }
             Token::StartTag { ref name, .. } if name == "frameset" => {
-                // Ignore unless frameset_ok
+                // Parse error. Ignore unless frameset_ok
+                self.error();
                 if self.frameset_ok {
                     if let Token::StartTag {
                         name, attributes, ..
@@ -2745,18 +3017,30 @@ impl<'a> TreeBuilder<'a> {
             Token::Eof => {
                 if !self.template_modes.is_empty() {
                     self.handle_in_template(Token::Eof);
+                } else if self.has_unclosed_element() {
+                    self.error();
                 }
                 // Stop parsing
             }
             Token::EndTag { ref name } if name == "body" => {
                 if self.element_in_scope("body") {
+                    if self.has_unclosed_element() {
+                        self.error();
+                    }
                     self.mode = InsertionMode::AfterBody;
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name } if name == "html" => {
                 if self.element_in_scope("body") {
+                    if self.has_unclosed_element() {
+                        self.error();
+                    }
                     self.mode = InsertionMode::AfterBody;
                     self.process_token(token);
+                } else {
+                    self.error();
                 }
             }
             Token::StartTag { ref name, .. }
@@ -2804,6 +3088,7 @@ impl<'a> TreeBuilder<'a> {
                     self.close_p_element();
                 }
                 if is_heading(self.current_node_name()) {
+                    self.error();
                     self.open_elements.pop();
                 }
                 if let Token::StartTag {
@@ -2831,6 +3116,7 @@ impl<'a> TreeBuilder<'a> {
                     && !self.open_elements.iter().any(|e| e.name == "template")
                 {
                     // Parse error, ignore
+                    self.error();
                 } else {
                     if self.element_in_button_scope("p") {
                         self.close_p_element();
@@ -2853,6 +3139,9 @@ impl<'a> TreeBuilder<'a> {
                     let entry_name = self.open_elements[i].name.clone();
                     if entry_name == "li" {
                         self.generate_implied_end_tags(Some("li"));
+                        if !self.current_node_is_html("li") {
+                            self.error();
+                        }
                         while let Some(e) = self.open_elements.pop() {
                             if e.name == "li" {
                                 break;
@@ -2882,6 +3171,9 @@ impl<'a> TreeBuilder<'a> {
                     let entry_name = self.open_elements[i].name.clone();
                     if matches!(entry_name.as_str(), "dd" | "dt") {
                         self.generate_implied_end_tags(Some(&entry_name));
+                        if !self.current_node_is_html(&entry_name) {
+                            self.error();
+                        }
                         while let Some(e) = self.open_elements.pop() {
                             if e.name == entry_name {
                                 break;
@@ -2919,6 +3211,7 @@ impl<'a> TreeBuilder<'a> {
             }
             Token::StartTag { ref name, .. } if name == "button" => {
                 if self.element_in_scope("button") {
+                    self.error();
                     self.generate_implied_end_tags(None);
                     while let Some(e) = self.open_elements.pop() {
                         if e.name == "button" {
@@ -2970,38 +3263,53 @@ impl<'a> TreeBuilder<'a> {
                 if let Token::EndTag { name } = token {
                     if self.element_in_scope(&name) {
                         self.generate_implied_end_tags(None);
+                        if !self.current_node_is_html(&name) {
+                            self.error();
+                        }
                         while let Some(e) = self.open_elements.pop() {
                             if e.name == name {
                                 break;
                             }
                         }
+                    } else {
+                        self.error();
                     }
                 }
             }
             Token::EndTag { ref name } if name == "form" => {
                 if !self.open_elements.iter().any(|e| e.name == "template") {
                     let node = self.form_pointer.take();
-                    if let Some(form_id) = node {
-                        if self.element_in_scope("form") {
+                    match node {
+                        Some(form_id) if self.element_in_scope("form") => {
                             self.generate_implied_end_tags(None);
+                            if self.current_node() != Some(form_id) {
+                                self.error();
+                            }
                             if let Some(pos) =
                                 self.open_elements.iter().position(|e| e.node_id == form_id)
                             {
                                 self.open_elements.remove(pos);
                             }
                         }
+                        _ => self.error(),
                     }
                 } else if self.element_in_scope("form") {
                     self.generate_implied_end_tags(None);
+                    if !self.current_node_is_html("form") {
+                        self.error();
+                    }
                     while let Some(e) = self.open_elements.pop() {
                         if e.name == "form" {
                             break;
                         }
                     }
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name } if name == "p" => {
                 if !self.element_in_button_scope("p") {
+                    self.error();
                     self.insert_html_element("p", &[]);
                 }
                 self.close_p_element();
@@ -3009,22 +3317,32 @@ impl<'a> TreeBuilder<'a> {
             Token::EndTag { ref name } if name == "li" => {
                 if self.element_in_list_item_scope("li") {
                     self.generate_implied_end_tags(Some("li"));
+                    if !self.current_node_is_html("li") {
+                        self.error();
+                    }
                     while let Some(e) = self.open_elements.pop() {
                         if e.name == "li" {
                             break;
                         }
                     }
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name } if matches!(name.as_str(), "dd" | "dt") => {
                 if let Token::EndTag { name } = token {
                     if self.element_in_scope(&name) {
                         self.generate_implied_end_tags(Some(&name));
+                        if !self.current_node_is_html(&name) {
+                            self.error();
+                        }
                         while let Some(e) = self.open_elements.pop() {
                             if e.name == name {
                                 break;
                             }
                         }
+                    } else {
+                        self.error();
                     }
                 }
             }
@@ -3037,11 +3355,16 @@ impl<'a> TreeBuilder<'a> {
                     || self.element_in_scope("h6")
                 {
                     self.generate_implied_end_tags(None);
+                    if !self.current_node_is_html(name) {
+                        self.error();
+                    }
                     while let Some(e) = self.open_elements.pop() {
                         if is_heading(&e.name) {
                             break;
                         }
                     }
+                } else {
+                    self.error();
                 }
             }
             Token::StartTag { ref name, .. } if name == "a" => {
@@ -3062,6 +3385,7 @@ impl<'a> TreeBuilder<'a> {
                     found
                 };
                 if existing_a.is_some() {
+                    self.error();
                     self.adoption_agency("a");
                     // Remove from formatting list if still there (only
                     // between end and last marker, matching the search above).
@@ -3124,6 +3448,7 @@ impl<'a> TreeBuilder<'a> {
             Token::StartTag { ref name, .. } if name == "nobr" => {
                 self.reconstruct_formatting();
                 if self.element_in_scope("nobr") {
+                    self.error();
                     self.adoption_agency("nobr");
                     self.reconstruct_formatting();
                 }
@@ -3159,12 +3484,17 @@ impl<'a> TreeBuilder<'a> {
                 if let Token::EndTag { name } = token {
                     if self.element_in_scope(&name) {
                         self.generate_implied_end_tags(None);
+                        if !self.current_node_is_html(&name) {
+                            self.error();
+                        }
                         while let Some(e) = self.open_elements.pop() {
                             if e.name == name {
                                 break;
                             }
                         }
                         self.clear_formatting_to_marker();
+                    } else {
+                        self.error();
                     }
                 }
             }
@@ -3183,6 +3513,7 @@ impl<'a> TreeBuilder<'a> {
             }
             Token::EndTag { ref name } if name == "br" => {
                 // Parse error — treat as start tag
+                self.error();
                 self.reconstruct_formatting();
                 self.insert_html_element("br", &[]);
                 self.open_elements.pop();
@@ -3201,6 +3532,7 @@ impl<'a> TreeBuilder<'a> {
                 {
                     self.insert_html_element(&name, &attributes);
                     self.open_elements.pop(); // void
+                    self.acknowledge_self_closing();
                     self.frameset_ok = false;
                 }
             }
@@ -3215,6 +3547,7 @@ impl<'a> TreeBuilder<'a> {
                         .any(|a| a.name == "type" && a.value.eq_ignore_ascii_case("hidden"));
                     self.insert_html_element(&name, &attributes);
                     self.open_elements.pop(); // void
+                    self.acknowledge_self_closing();
                     if !is_hidden {
                         self.frameset_ok = false;
                     }
@@ -3229,6 +3562,7 @@ impl<'a> TreeBuilder<'a> {
                 {
                     self.insert_html_element(&name, &attributes);
                     self.open_elements.pop(); // void
+                    self.acknowledge_self_closing();
                 }
             }
             Token::StartTag { ref name, .. } if name == "hr" => {
@@ -3241,15 +3575,18 @@ impl<'a> TreeBuilder<'a> {
                 {
                     self.insert_html_element(&name, &attributes);
                     self.open_elements.pop(); // void
+                    self.acknowledge_self_closing();
                     self.frameset_ok = false;
                 }
             }
             Token::StartTag { ref name, .. } if name == "image" => {
                 // Parse error — change to "img"
+                self.error();
                 self.reconstruct_formatting();
                 if let Token::StartTag { attributes, .. } = token {
                     self.insert_html_element("img", &attributes);
                     self.open_elements.pop();
+                    self.acknowledge_self_closing();
                     self.frameset_ok = false;
                 }
             }
@@ -3342,6 +3679,9 @@ impl<'a> TreeBuilder<'a> {
             Token::StartTag { ref name, .. } if matches!(name.as_str(), "rb" | "rtc") => {
                 if self.element_in_scope("ruby") {
                     self.generate_implied_end_tags(None);
+                    if !self.current_node_is_html("ruby") {
+                        self.error();
+                    }
                 }
                 if let Token::StartTag {
                     name, attributes, ..
@@ -3353,6 +3693,9 @@ impl<'a> TreeBuilder<'a> {
             Token::StartTag { ref name, .. } if matches!(name.as_str(), "rp" | "rt") => {
                 if self.element_in_scope("ruby") {
                     self.generate_implied_end_tags(Some("rtc"));
+                    if !self.current_node_is_html("ruby") && !self.current_node_is_html("rtc") {
+                        self.error();
+                    }
                 }
                 if let Token::StartTag {
                     name, attributes, ..
@@ -3381,6 +3724,7 @@ impl<'a> TreeBuilder<'a> {
                     self.insert_foreign_element("math", &adjusted, Namespace::MathMl);
                     if self_closing {
                         self.open_elements.pop();
+                        self.acknowledge_self_closing();
                     }
                 }
             }
@@ -3404,6 +3748,7 @@ impl<'a> TreeBuilder<'a> {
                     self.insert_foreign_element("svg", &adjusted, Namespace::Svg);
                     if self_closing {
                         self.open_elements.pop();
+                        self.acknowledge_self_closing();
                     }
                 }
             }
@@ -3424,6 +3769,7 @@ impl<'a> TreeBuilder<'a> {
                 ) =>
             {
                 // Parse error, ignore
+                self.error();
             }
             Token::StartTag {
                 name, attributes, ..
@@ -3443,13 +3789,17 @@ impl<'a> TreeBuilder<'a> {
         for i in (0..self.open_elements.len()).rev() {
             if self.open_elements[i].name == name && self.open_elements[i].ns == Namespace::Html {
                 self.generate_implied_end_tags(Some(name));
+                if self.open_elements.len() - 1 != i {
+                    self.error();
+                }
                 while self.open_elements.len() > i {
                     self.open_elements.pop();
                 }
                 return;
             }
             if is_special_element_ns(&self.open_elements[i].name, self.open_elements[i].ns) {
-                return; // Parse error, ignore
+                self.error(); // Parse error, ignore
+                return;
             }
         }
     }
@@ -3461,6 +3811,7 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_character(c);
             }
             Token::Eof => {
+                self.error();
                 self.open_elements.pop();
                 self.mode = self.original_mode;
                 self.process_token(Token::Eof);
@@ -3479,7 +3830,7 @@ impl<'a> TreeBuilder<'a> {
             Token::Character(_)
                 if matches!(
                     self.current_node_name(),
-                    "table" | "tbody" | "tfoot" | "thead" | "tr"
+                    "table" | "tbody" | "template" | "tfoot" | "thead" | "tr"
                 ) =>
             {
                 self.pending_table_chars.clear();
@@ -3488,7 +3839,7 @@ impl<'a> TreeBuilder<'a> {
                 self.process_token(token);
             }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "caption" => {
                 self.clear_stack_back_to_table_context();
                 self.push_formatting_marker();
@@ -3535,6 +3886,7 @@ impl<'a> TreeBuilder<'a> {
                 self.process_token(token);
             }
             Token::StartTag { ref name, .. } if name == "table" => {
+                self.error();
                 if self.element_in_table_scope("table") {
                     while let Some(e) = self.open_elements.pop() {
                         if e.name == "table" {
@@ -3553,6 +3905,8 @@ impl<'a> TreeBuilder<'a> {
                         }
                     }
                     self.reset_insertion_mode();
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name }
@@ -3572,6 +3926,7 @@ impl<'a> TreeBuilder<'a> {
                 ) =>
             {
                 // Parse error, ignore
+                self.error();
             }
             Token::StartTag { ref name, .. }
                 if matches!(name.as_str(), "style" | "script" | "template") =>
@@ -3586,6 +3941,7 @@ impl<'a> TreeBuilder<'a> {
                     let is_hidden = attributes
                         .iter()
                         .any(|a| a.name == "type" && a.value.eq_ignore_ascii_case("hidden"));
+                    self.error();
                     if is_hidden {
                         if let Token::StartTag {
                             name, attributes, ..
@@ -3593,6 +3949,7 @@ impl<'a> TreeBuilder<'a> {
                         {
                             self.insert_html_element(&name, &attributes);
                             self.open_elements.pop();
+                            self.acknowledge_self_closing();
                         }
                     } else {
                         self.foster_parenting = true;
@@ -3602,6 +3959,7 @@ impl<'a> TreeBuilder<'a> {
                 }
             }
             Token::StartTag { ref name, .. } if name == "form" => {
+                self.error();
                 if self.form_pointer.is_none()
                     && !self.open_elements.iter().any(|e| e.name == "template")
                 {
@@ -3619,7 +3977,8 @@ impl<'a> TreeBuilder<'a> {
                 self.handle_in_body(token);
             }
             _ => {
-                // Foster parenting
+                // Parse error: foster parenting
+                self.error();
                 self.foster_parenting = true;
                 self.handle_in_body(token);
                 self.foster_parenting = false;
@@ -3629,7 +3988,7 @@ impl<'a> TreeBuilder<'a> {
 
     fn handle_in_table_text(&mut self, token: Token) {
         match token {
-            Token::Character('\0') => { /* ignore */ }
+            Token::Character('\0') => self.error(),
             Token::Character(c) => {
                 self.pending_table_chars.push(c);
             }
@@ -3637,7 +3996,10 @@ impl<'a> TreeBuilder<'a> {
                 let chars: Vec<char> = std::mem::take(&mut self.pending_table_chars);
                 let has_non_ws = chars.iter().any(|c| !is_ascii_whitespace(*c));
                 if has_non_ws {
-                    // Foster parent each character
+                    // Each character is a parse error. Foster parent them.
+                    for _ in &chars {
+                        self.error();
+                    }
                     self.foster_parenting = true;
                     for c in chars {
                         self.reconstruct_formatting();
@@ -3661,14 +4023,7 @@ impl<'a> TreeBuilder<'a> {
     fn handle_in_caption(&mut self, token: Token) {
         match token {
             Token::EndTag { ref name } if name == "caption" => {
-                if self.element_in_table_scope("caption") {
-                    self.generate_implied_end_tags(None);
-                    while let Some(e) = self.open_elements.pop() {
-                        if e.name == "caption" {
-                            break;
-                        }
-                    }
-                    self.clear_formatting_to_marker();
+                if self.close_caption() {
                     self.mode = InsertionMode::InTable;
                 }
             }
@@ -3686,28 +4041,12 @@ impl<'a> TreeBuilder<'a> {
                         | "tr"
                 ) =>
             {
-                if self.element_in_table_scope("caption") {
-                    self.generate_implied_end_tags(None);
-                    while let Some(e) = self.open_elements.pop() {
-                        if e.name == "caption" {
-                            break;
-                        }
-                    }
-                    self.clear_formatting_to_marker();
-                    self.mode = InsertionMode::InTable;
+                if self.close_caption() {
                     self.process_token(token);
                 }
             }
             Token::EndTag { ref name } if name == "table" => {
-                if self.element_in_table_scope("caption") {
-                    self.generate_implied_end_tags(None);
-                    while let Some(e) = self.open_elements.pop() {
-                        if e.name == "caption" {
-                            break;
-                        }
-                    }
-                    self.clear_formatting_to_marker();
-                    self.mode = InsertionMode::InTable;
+                if self.close_caption() {
                     self.process_token(token);
                 }
             }
@@ -3726,7 +4065,8 @@ impl<'a> TreeBuilder<'a> {
                         | "tr"
                 ) =>
             {
-                // ignore
+                // Parse error, ignore
+                self.error();
             }
             _ => {
                 self.handle_in_body(token);
@@ -3740,7 +4080,7 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_character(c);
             }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
@@ -3751,17 +4091,21 @@ impl<'a> TreeBuilder<'a> {
                 {
                     self.insert_html_element(&name, &attributes);
                     self.open_elements.pop(); // void
+                    self.acknowledge_self_closing();
                 }
             }
             Token::EndTag { ref name } if name == "colgroup" => {
                 if self.current_node_name() == "colgroup" {
                     self.open_elements.pop();
                     self.mode = InsertionMode::InTable;
+                } else {
+                    // Parse error, ignore
+                    self.error();
                 }
-                // else: parse error, ignore
             }
             Token::EndTag { ref name } if name == "col" => {
-                // parse error, ignore
+                // Parse error, ignore
+                self.error();
             }
             Token::StartTag { ref name, .. } if name == "template" => {
                 self.handle_in_head(token);
@@ -3777,6 +4121,9 @@ impl<'a> TreeBuilder<'a> {
                     self.open_elements.pop();
                     self.mode = InsertionMode::InTable;
                     self.process_token(token);
+                } else {
+                    // Parse error, ignore
+                    self.error();
                 }
             }
         }
@@ -3795,6 +4142,7 @@ impl<'a> TreeBuilder<'a> {
                 }
             }
             Token::StartTag { ref name, .. } if matches!(name.as_str(), "th" | "td") => {
+                self.error();
                 self.clear_stack_back_to_table_body_context();
                 self.insert_html_element("tr", &[]);
                 self.mode = InsertionMode::InRow;
@@ -3806,6 +4154,8 @@ impl<'a> TreeBuilder<'a> {
                         self.clear_stack_back_to_table_body_context();
                         self.open_elements.pop();
                         self.mode = InsertionMode::InTable;
+                    } else {
+                        self.error();
                     }
                 }
             }
@@ -3823,6 +4173,8 @@ impl<'a> TreeBuilder<'a> {
                     self.open_elements.pop();
                     self.mode = InsertionMode::InTable;
                     self.process_token(token);
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name } if name == "table" => {
@@ -3834,6 +4186,8 @@ impl<'a> TreeBuilder<'a> {
                     self.open_elements.pop();
                     self.mode = InsertionMode::InTable;
                     self.process_token(token);
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name }
@@ -3842,7 +4196,8 @@ impl<'a> TreeBuilder<'a> {
                     "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th" | "tr"
                 ) =>
             {
-                // ignore
+                // Parse error, ignore
+                self.error();
             }
             _ => {
                 self.handle_in_table(token);
@@ -3868,6 +4223,8 @@ impl<'a> TreeBuilder<'a> {
                     self.clear_stack_back_to_table_row_context();
                     self.open_elements.pop();
                     self.mode = InsertionMode::InTableBody;
+                } else {
+                    self.error();
                 }
             }
             Token::StartTag { ref name, .. }
@@ -3881,6 +4238,8 @@ impl<'a> TreeBuilder<'a> {
                     self.open_elements.pop();
                     self.mode = InsertionMode::InTableBody;
                     self.process_token(token);
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name } if name == "table" => {
@@ -3889,10 +4248,14 @@ impl<'a> TreeBuilder<'a> {
                     self.open_elements.pop();
                     self.mode = InsertionMode::InTableBody;
                     self.process_token(token);
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name } if matches!(name.as_str(), "tbody" | "tfoot" | "thead") => {
-                if self.element_in_table_scope(name) && self.element_in_table_scope("tr") {
+                if !self.element_in_table_scope(name) {
+                    self.error();
+                } else if self.element_in_table_scope("tr") {
                     self.clear_stack_back_to_table_row_context();
                     self.open_elements.pop();
                     self.mode = InsertionMode::InTableBody;
@@ -3905,7 +4268,8 @@ impl<'a> TreeBuilder<'a> {
                     "body" | "caption" | "col" | "colgroup" | "html" | "td" | "th"
                 ) =>
             {
-                // ignore
+                // Parse error, ignore
+                self.error();
             }
             _ => {
                 self.handle_in_table(token);
@@ -3919,6 +4283,9 @@ impl<'a> TreeBuilder<'a> {
                 if let Token::EndTag { name } = token {
                     if self.element_in_table_scope(&name) {
                         self.generate_implied_end_tags(None);
+                        if !self.current_node_is_html(&name) {
+                            self.error();
+                        }
                         while let Some(e) = self.open_elements.pop() {
                             if e.name == name && e.ns == Namespace::Html {
                                 break;
@@ -3926,6 +4293,8 @@ impl<'a> TreeBuilder<'a> {
                         }
                         self.clear_formatting_to_marker();
                         self.mode = InsertionMode::InRow;
+                    } else {
+                        self.error();
                     }
                 }
             }
@@ -3946,6 +4315,8 @@ impl<'a> TreeBuilder<'a> {
                 if self.element_in_table_scope("td") || self.element_in_table_scope("th") {
                     self.close_cell();
                     self.process_token(token);
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name }
@@ -3954,7 +4325,8 @@ impl<'a> TreeBuilder<'a> {
                     "body" | "caption" | "col" | "colgroup" | "html"
                 ) =>
             {
-                // ignore
+                // Parse error, ignore
+                self.error();
             }
             Token::EndTag { ref name }
                 if matches!(name.as_str(), "table" | "tbody" | "tfoot" | "thead" | "tr") =>
@@ -3963,6 +4335,8 @@ impl<'a> TreeBuilder<'a> {
                     if self.element_in_table_scope(name) {
                         self.close_cell();
                         self.process_token(token);
+                    } else {
+                        self.error();
                     }
                 }
             }
@@ -3972,8 +4346,32 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
+    /// Closes the caption, if one is in table scope, and switches to "in
+    /// table"; otherwise it is a parse error. Returns whether it closed.
+    fn close_caption(&mut self) -> bool {
+        if !self.element_in_table_scope("caption") {
+            self.error();
+            return false;
+        }
+        self.generate_implied_end_tags(None);
+        if !self.current_node_is_html("caption") {
+            self.error();
+        }
+        while let Some(e) = self.open_elements.pop() {
+            if e.name == "caption" {
+                break;
+            }
+        }
+        self.clear_formatting_to_marker();
+        self.mode = InsertionMode::InTable;
+        true
+    }
+
     fn close_cell(&mut self) {
         self.generate_implied_end_tags(None);
+        if !self.current_node_is_html("td") && !self.current_node_is_html("th") {
+            self.error();
+        }
         while let Some(e) = self.open_elements.pop() {
             if matches!(e.name.as_str(), "td" | "th") {
                 break;
@@ -3986,13 +4384,13 @@ impl<'a> TreeBuilder<'a> {
     #[allow(clippy::too_many_lines, clippy::match_same_arms)]
     fn handle_in_select(&mut self, token: Token) {
         match token {
-            Token::Character('\0') => { /* ignore */ }
+            Token::Character('\0') => self.error(),
             Token::Character(c) => {
                 self.reconstruct_formatting();
                 self.insert_character(c);
             }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
@@ -4035,6 +4433,7 @@ impl<'a> TreeBuilder<'a> {
                 {
                     self.insert_html_element(&name, &attributes);
                     self.open_elements.pop(); // void
+                    self.acknowledge_self_closing();
                 }
             }
             Token::EndTag { ref name } if name == "optgroup" => {
@@ -4046,11 +4445,15 @@ impl<'a> TreeBuilder<'a> {
                 }
                 if self.current_node_name() == "optgroup" {
                     self.open_elements.pop();
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name } if name == "option" => {
                 if self.current_node_name() == "option" {
                     self.open_elements.pop();
+                } else {
+                    self.error();
                 }
             }
             Token::EndTag { ref name } if name == "select" => {
@@ -4061,10 +4464,13 @@ impl<'a> TreeBuilder<'a> {
                         }
                     }
                     self.reset_insertion_mode();
+                } else {
+                    self.error();
                 }
             }
             Token::StartTag { ref name, .. } if name == "select" => {
                 // Parse error — act as end tag
+                self.error();
                 if self.element_in_select_scope("select") {
                     while let Some(e) = self.open_elements.pop() {
                         if e.name == "select" {
@@ -4075,7 +4481,8 @@ impl<'a> TreeBuilder<'a> {
                 }
             }
             Token::StartTag { ref name, .. } if matches!(name.as_str(), "input" | "textarea") => {
-                // Close select and reprocess
+                // Parse error. Close select and reprocess
+                self.error();
                 if self.element_in_select_scope("select") {
                     while let Some(e) = self.open_elements.pop() {
                         if e.name == "select" {
@@ -4149,6 +4556,7 @@ impl<'a> TreeBuilder<'a> {
                     self.insert_foreign_element("svg", &adjusted, Namespace::Svg);
                     if self_closing {
                         self.open_elements.pop();
+                        self.acknowledge_self_closing();
                     }
                 }
             }
@@ -4171,6 +4579,7 @@ impl<'a> TreeBuilder<'a> {
                     self.insert_foreign_element("math", &adjusted, Namespace::MathMl);
                     if self_closing {
                         self.open_elements.pop();
+                        self.acknowledge_self_closing();
                     }
                 }
             }
@@ -4193,7 +4602,7 @@ impl<'a> TreeBuilder<'a> {
             Token::Eof => {
                 self.handle_in_body(token);
             }
-            Token::EndTag { .. } => { /* ignore */ }
+            Token::EndTag { .. } => self.error(),
         }
     }
 
@@ -4205,6 +4614,7 @@ impl<'a> TreeBuilder<'a> {
                     "caption" | "table" | "tbody" | "tfoot" | "thead" | "tr" | "td" | "th"
                 ) =>
             {
+                self.error();
                 while let Some(e) = self.open_elements.pop() {
                     if e.name == "select" {
                         break;
@@ -4219,6 +4629,7 @@ impl<'a> TreeBuilder<'a> {
                     "caption" | "table" | "tbody" | "tfoot" | "thead" | "tr" | "td" | "th"
                 ) =>
             {
+                self.error();
                 if let Token::EndTag { ref name } = token {
                     if self.element_in_table_scope(name) {
                         while let Some(e) = self.open_elements.pop() {
@@ -4298,6 +4709,7 @@ impl<'a> TreeBuilder<'a> {
                     .iter()
                     .any(|e| e.name == "template" && e.ns == Namespace::Html)
                 {
+                    self.error();
                     self.generate_all_implied_end_tags();
                     while let Some(e) = self.open_elements.pop() {
                         if e.name == "template" && e.ns == Namespace::Html {
@@ -4318,7 +4730,8 @@ impl<'a> TreeBuilder<'a> {
                 self.process_token(token);
             }
             Token::EndTag { .. } => {
-                // ignore
+                // Parse error, ignore
+                self.error();
             }
         }
     }
@@ -4337,13 +4750,14 @@ impl<'a> TreeBuilder<'a> {
                     self.doc.append_child(html_id, comment_id);
                 }
             }
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
             Token::EndTag { ref name } if name == "html" => {
                 if self.fragment_context.is_some() {
                     // Fragment case: ignore the token (parse error).
+                    self.error();
                 } else {
                     self.mode = InsertionMode::AfterAfterBody;
                 }
@@ -4352,6 +4766,7 @@ impl<'a> TreeBuilder<'a> {
                 // Stop parsing
             }
             _ => {
+                self.error();
                 self.mode = InsertionMode::InBody;
                 self.process_token(token);
             }
@@ -4365,7 +4780,7 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_character(c);
             }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
@@ -4392,15 +4807,19 @@ impl<'a> TreeBuilder<'a> {
                 {
                     self.insert_html_element(&name, &attributes);
                     self.open_elements.pop(); // void
+                    self.acknowledge_self_closing();
                 }
             }
             Token::StartTag { ref name, .. } if name == "noframes" => {
                 self.handle_in_head(token);
             }
             Token::Eof => {
+                if self.current_node_name() != "html" {
+                    self.error();
+                }
                 // Stop parsing
             }
-            _ => { /* ignore */ }
+            _ => self.error(),
         }
     }
 
@@ -4411,7 +4830,7 @@ impl<'a> TreeBuilder<'a> {
                 self.insert_character(c);
             }
             Token::Comment(data) => self.insert_comment(&data),
-            Token::Doctype { .. } => { /* ignore */ }
+            Token::Doctype { .. } => self.error(),
             Token::StartTag { ref name, .. } if name == "html" => {
                 self.handle_in_body(token);
             }
@@ -4424,7 +4843,7 @@ impl<'a> TreeBuilder<'a> {
             Token::Eof => {
                 // Stop parsing
             }
-            _ => { /* ignore */ }
+            _ => self.error(),
         }
     }
 
@@ -4444,6 +4863,7 @@ impl<'a> TreeBuilder<'a> {
                 // Stop parsing
             }
             _ => {
+                self.error();
                 self.mode = InsertionMode::InBody;
                 self.process_token(token);
             }
@@ -4468,7 +4888,7 @@ impl<'a> TreeBuilder<'a> {
             Token::Eof => {
                 // Stop parsing
             }
-            _ => { /* ignore */ }
+            _ => self.error(),
         }
     }
 
@@ -4931,5 +5351,78 @@ mod tests {
             namespace_of_mi(Some("MathML-Presentation")).as_deref(),
             Some("http://www.w3.org/1998/Math/MathML")
         );
+    }
+
+    /// A parse's errors, as (message, line, column).
+    fn error_list(input: &str) -> Vec<(String, u32, u32)> {
+        let result = parse_html5_full(input);
+        let messages: Vec<&str> = result.errors.iter().map(|e| e.message.as_str()).collect();
+        let details: Vec<(String, u32, u32)> = result
+            .error_details
+            .iter()
+            .map(|e| (e.message(), e.location.line, e.location.column))
+            .collect();
+        assert_eq!(
+            messages,
+            details.iter().map(|d| d.0.as_str()).collect::<Vec<_>>()
+        );
+        details
+    }
+
+    #[test]
+    fn test_tree_construction_error() {
+        assert_eq!(
+            error_list("<p>"),
+            vec![("expected a DOCTYPE".to_string(), 1, 1)]
+        );
+        let result = parse_html5_full("<!DOCTYPE html><p></div>");
+        assert_eq!(result.error_details.len(), 1);
+        let error = &result.error_details[0];
+        assert_eq!(
+            error.kind,
+            Html5ErrorKind::TreeConstruction {
+                token: Html5ErrorToken::EndTag("div".to_string()),
+                before_doctype: false,
+                open_elements: vec!["html".into(), "body".into(), "p".into()],
+            }
+        );
+        assert_eq!(error.location.byte_offset, 18);
+        assert_eq!(error.message(), "unexpected end tag </div>");
+    }
+
+    #[test]
+    fn test_errors_are_in_the_order_they_occurred() {
+        // The tokenizer's errors and tree construction's interleave.
+        assert_eq!(
+            error_list("<!DOCTYPE html>\0<p></div>"),
+            vec![
+                ("unexpected-null-character".to_string(), 1, 16),
+                ("unexpected NULL character".to_string(), 1, 16),
+                ("unexpected end tag </div>".to_string(), 1, 20),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_error_locations_count_characters_on_normalized_lines() {
+        let div = || "unexpected end tag </div>".to_string();
+        assert_eq!(
+            error_list("<!DOCTYPE html>\u{e9}</div>"),
+            vec![(div(), 1, 17)]
+        );
+        assert_eq!(
+            error_list("<!DOCTYPE html>\r\n\r\n</div>"),
+            vec![(div(), 3, 1)]
+        );
+    }
+
+    #[test]
+    fn test_self_closing_non_void_html_element_is_an_error() {
+        let code = "non-void-html-element-start-tag-with-trailing-solidus";
+        assert_eq!(
+            error_list("<!DOCTYPE html><div/></div>"),
+            vec![(code.to_string(), 1, 16)]
+        );
+        assert!(error_list("<!DOCTYPE html><br/><svg><path/></svg>").is_empty());
     }
 }
