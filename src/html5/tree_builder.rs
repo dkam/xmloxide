@@ -373,6 +373,10 @@ pub struct Html5ParseOptions {
     /// Stop parsing when more than this many elements are open at once, and
     /// report [`Html5Limit::TreeDepth`]. `None` sets no limit.
     pub max_tree_depth: Option<usize>,
+    /// Keep at most this many errors: the first, in the order they
+    /// occurred. Errors past the limit aren't recorded, so a document full
+    /// of them costs no more than one with a few. `None` keeps them all.
+    pub max_errors: Option<usize>,
 }
 
 /// A limit from [`Html5ParseOptions`] that the input exceeded, which stopped
@@ -492,6 +496,7 @@ pub fn parse_html5_full(input: &str) -> Html5ParseResult {
 pub fn parse_html5_full_with_options(input: &str, options: &Html5ParseOptions) -> Html5ParseResult {
     let mut tokenizer = Tokenizer::new(input);
     tokenizer.set_max_attributes(options.max_attributes);
+    tokenizer.set_max_errors(options.max_errors);
     let mut builder = TreeBuilder::new(tokenizer, options);
     builder.run();
 
@@ -519,6 +524,10 @@ pub fn parse_html5_full_with_options(input: &str, options: &Html5ParseOptions) -
         });
     }
     push_tokenizer_errors(&mut error_details, usize::MAX);
+    // Each list kept its first max_errors; together they may have more.
+    if let Some(max) = options.max_errors {
+        error_details.truncate(max);
+    }
     let errors = error_details
         .iter()
         .map(|error| ParseDiagnostic {
@@ -528,7 +537,14 @@ pub fn parse_html5_full_with_options(input: &str, options: &Html5ParseOptions) -
         })
         .collect();
 
-    let limit_exceeded = builder.limit_exceeded();
+    // A tag cut off by the end of the input can still have had too many
+    // attributes.
+    let limit_exceeded = builder.stopped_by.or_else(|| {
+        builder
+            .tokenizer
+            .attribute_limit_exceeded()
+            .then_some(Html5Limit::Attributes)
+    });
     Html5ParseResult {
         document: builder.doc,
         errors,
@@ -998,7 +1014,8 @@ struct TreeBuilder<'a> {
     frameset_ok: bool,
     foster_parenting: bool,
     template_modes: Vec<InsertionMode>,
-    pending_table_chars: Vec<char>,
+    /// Characters in table text, each with the offset of its token.
+    pending_table_chars: Vec<(char, usize)>,
     /// When true, the next `Character('\n')` token is dropped (leading newline
     /// stripping after `<pre>`, `<listing>`, and `<textarea>`).
     skip_next_lf: bool,
@@ -1008,8 +1025,11 @@ struct TreeBuilder<'a> {
     fragment_form_ancestor: bool,
     fragment_context_encoding: Option<String>,
     max_tree_depth: Option<usize>,
+    /// The limit that stopped the parse, if one did.
+    stopped_by: Option<Html5Limit>,
     /// Tree construction errors, in the order they occurred.
     errors: Vec<TreeError>,
+    max_errors: Option<usize>,
     /// Whether the current start tag's self-closing flag was acknowledged.
     self_closing_acknowledged: bool,
     /// The token being processed, which tree construction errors name.
@@ -1052,7 +1072,9 @@ impl<'a> TreeBuilder<'a> {
             fragment_form_ancestor: options.fragment_form_ancestor,
             fragment_context_encoding: options.fragment_context_encoding.clone(),
             max_tree_depth: options.max_tree_depth,
+            stopped_by: None,
             errors: Vec::new(),
+            max_errors: options.max_errors,
             self_closing_acknowledged: false,
             current_token: Html5ErrorToken::EndOfFile,
         }
@@ -1165,18 +1187,27 @@ impl<'a> TreeBuilder<'a> {
         self.frameset_ok = false;
     }
 
-    /// The limit the input has exceeded so far, if any.
-    fn limit_exceeded(&self) -> Option<Html5Limit> {
-        if self.tokenizer.attribute_limit_exceeded() {
+    /// Whether the fragment is parsed in an SVG or `MathML` context. The
+    /// context element then sits on the stack, above the html element (see
+    /// `initialize_fragment`), though the input didn't open it.
+    fn has_foreign_context(&self) -> bool {
+        self.fragment_context
+            .as_ref()
+            .is_some_and(|(_, ns)| *ns != Namespace::Html)
+    }
+
+    /// Checks the limits, as Gumbo does before each token, and records the
+    /// one the input has exceeded. Parsing stops there.
+    fn stop_at_limit(&mut self) -> bool {
+        let depth = self.open_elements.len() - usize::from(self.has_foreign_context());
+        self.stopped_by = if self.tokenizer.attribute_limit_exceeded() {
             Some(Html5Limit::Attributes)
-        } else if self
-            .max_tree_depth
-            .is_some_and(|max| self.open_elements.len() > max)
-        {
+        } else if self.max_tree_depth.is_some_and(|max| depth > max) {
             Some(Html5Limit::TreeDepth)
         } else {
             None
-        }
+        };
+        self.stopped_by.is_some()
     }
 
     fn run(&mut self) {
@@ -1184,7 +1215,7 @@ impl<'a> TreeBuilder<'a> {
             self.initialize_fragment();
         }
         loop {
-            if self.limit_exceeded().is_some() {
+            if self.stop_at_limit() {
                 return;
             }
             // Inform the tokenizer whether the adjusted current node is in
@@ -1234,6 +1265,9 @@ impl<'a> TreeBuilder<'a> {
                                 if !buf.is_empty() {
                                     self.reconstruct_formatting();
                                     self.insert_characters(&buf);
+                                }
+                                if self.stop_at_limit() {
+                                    return;
                                 }
                                 if next == Token::Eof {
                                     self.process_next_token(next);
@@ -1368,10 +1402,24 @@ impl<'a> TreeBuilder<'a> {
         self.self_closing_acknowledged = true;
     }
 
+    /// Whether as many errors as `max_errors` allows have been recorded.
+    fn error_limit_reached(&self) -> bool {
+        self.max_errors
+            .is_some_and(|max| self.errors.len() + self.tokenizer.errors().len() >= max)
+    }
+
+    /// Records an error on the token being processed.
     fn record_error(&mut self, kind: Html5ErrorKind) {
+        self.record_error_at(kind, self.tokenizer.token_start());
+    }
+
+    fn record_error_at(&mut self, kind: Html5ErrorKind, offset: usize) {
+        if self.error_limit_reached() {
+            return;
+        }
         self.errors.push(TreeError {
             kind,
-            offset: self.tokenizer.token_start(),
+            offset,
             tokenizer_errors: self.tokenizer.errors().len(),
         });
     }
@@ -1390,12 +1438,21 @@ impl<'a> TreeBuilder<'a> {
 
     /// A tree construction parse error on the token being processed.
     fn error(&mut self) {
+        self.error_at(self.current_token.clone(), self.tokenizer.token_start());
+    }
+
+    /// A tree construction parse error on `token`, which began at `offset`.
+    fn error_at(&mut self, token: Html5ErrorToken, offset: usize) {
+        // Checked first, to spare copying the stack.
+        if self.error_limit_reached() {
+            return;
+        }
         let kind = Html5ErrorKind::TreeConstruction {
-            token: self.current_token.clone(),
+            token,
             before_doctype: self.mode == InsertionMode::Initial,
             open_elements: self.open_elements.iter().map(|e| e.name.clone()).collect(),
         };
-        self.record_error(kind);
+        self.record_error_at(kind, offset);
     }
 
     fn process_token(&mut self, token: Token) {
@@ -1634,11 +1691,7 @@ impl<'a> TreeBuilder<'a> {
         // The current node is the foreign fragment context element when it is
         // the only element the fragment has open; for the specification it
         // isn't on the stack at all, so its end tag matches nothing.
-        let at_context = self.open_elements.len() == 2
-            && self
-                .fragment_context
-                .as_ref()
-                .is_some_and(|(_, ns)| *ns != Namespace::Html);
+        let at_context = self.open_elements.len() == 2 && self.has_foreign_context();
         if at_context || !self.current_node_name().eq_ignore_ascii_case(tag_name) {
             self.error();
         }
@@ -1803,14 +1856,13 @@ impl<'a> TreeBuilder<'a> {
     /// Whether an element other than those the end of the body may leave
     /// open is open (the spec's check on EOF, `</body>` and `</html>`).
     fn has_unclosed_element(&self) -> bool {
-        // A foreign fragment context element sits on the stack (see
-        // `initialize_fragment`), but isn't an element the input opened.
-        let context = usize::from(
-            self.fragment_context
-                .as_ref()
-                .is_some_and(|(_, ns)| *ns != Namespace::Html),
-        );
-        let skip = if context == 1 { 1 } else { usize::MAX };
+        // A foreign fragment context element isn't an element the input
+        // opened.
+        let skip = if self.has_foreign_context() {
+            1
+        } else {
+            usize::MAX
+        };
         self.open_elements.iter().enumerate().any(|(i, e)| {
             i != skip
                 && (e.ns != Namespace::Html
@@ -3990,18 +4042,20 @@ impl<'a> TreeBuilder<'a> {
         match token {
             Token::Character('\0') => self.error(),
             Token::Character(c) => {
-                self.pending_table_chars.push(c);
+                let offset = self.tokenizer.token_start();
+                self.pending_table_chars.push((c, offset));
             }
             _ => {
-                let chars: Vec<char> = std::mem::take(&mut self.pending_table_chars);
-                let has_non_ws = chars.iter().any(|c| !is_ascii_whitespace(*c));
+                let chars = std::mem::take(&mut self.pending_table_chars);
+                let has_non_ws = chars.iter().any(|(c, _)| !is_ascii_whitespace(*c));
                 if has_non_ws {
-                    // Each character is a parse error. Foster parent them.
-                    for _ in &chars {
-                        self.error();
+                    // Each character is a parse error, at the character.
+                    // Foster parent them.
+                    for &(c, offset) in &chars {
+                        self.error_at(Html5ErrorToken::Character(c), offset);
                     }
                     self.foster_parenting = true;
-                    for c in chars {
+                    for (c, _) in chars {
                         self.reconstruct_formatting();
                         self.insert_character(c);
                         if !is_ascii_whitespace(c) {
@@ -4010,7 +4064,7 @@ impl<'a> TreeBuilder<'a> {
                     }
                     self.foster_parenting = false;
                 } else {
-                    for c in chars {
+                    for (c, _) in chars {
                         self.insert_character(c);
                     }
                 }
@@ -5424,5 +5478,96 @@ mod tests {
             vec![(code.to_string(), 1, 16)]
         );
         assert!(error_list("<!DOCTYPE html><br/><svg><path/></svg>").is_empty());
+    }
+
+    #[test]
+    fn test_max_tree_depth_is_not_checked_after_the_end_of_the_input() {
+        // As in Gumbo, the limit is checked before each token; the elements
+        // the end of the input implies are never counted.
+        for (input, max) in [("", 0), ("<!-- c -->", 1)] {
+            let options = Html5ParseOptions {
+                max_tree_depth: Some(max),
+                ..Default::default()
+            };
+            assert_eq!(
+                parse_with(input, &options).limit_exceeded,
+                None,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_max_tree_depth_counts_elements_reopened_before_the_end() {
+        // "x" reopens b and i inside three divs: seven elements are open
+        // before the end of the input, more than at any point before.
+        let input = "<!DOCTYPE html><p><b><i></p><div><div><div>x";
+        let limit = |max| {
+            let options = Html5ParseOptions {
+                max_tree_depth: Some(max),
+                ..Default::default()
+            };
+            parse_with(input, &options).limit_exceeded
+        };
+        assert_eq!(limit(6), Some(Html5Limit::TreeDepth));
+        assert_eq!(limit(7), None);
+    }
+
+    #[test]
+    fn test_max_tree_depth_does_not_count_a_foreign_context_element() {
+        // The specification doesn't open the context element (WHATWG 13.4):
+        // html and the two g elements are open.
+        let limit = |max| {
+            let options = Html5ParseOptions {
+                fragment_context: Some("svg svg".to_string()),
+                max_tree_depth: Some(max),
+                ..Default::default()
+            };
+            parse_with("<g><g></g></g>", &options).limit_exceeded
+        };
+        assert_eq!(limit(2), Some(Html5Limit::TreeDepth));
+        assert_eq!(limit(3), None);
+    }
+
+    #[test]
+    fn test_max_errors_keeps_the_first_errors() {
+        // Tree construction and tokenizer errors, interleaved.
+        let input = "<p>\0</div></span>\0<x a a>";
+        let summary = |result: &Html5ParseResult| -> Vec<(String, usize)> {
+            result
+                .error_details
+                .iter()
+                .map(|e| (e.message(), e.location.byte_offset))
+                .collect()
+        };
+        let all = summary(&parse_html5_full(input));
+        assert!(all.len() > 4, "{all:?}");
+        for max in [0, 1, 3, all.len(), all.len() + 1] {
+            let options = Html5ParseOptions {
+                max_errors: Some(max),
+                ..Default::default()
+            };
+            let result = parse_with(input, &options);
+            let kept = max.min(all.len());
+            assert_eq!(summary(&result), all[..kept], "max_errors {max}");
+            assert_eq!(result.errors.len(), kept);
+        }
+    }
+
+    #[test]
+    fn test_table_text_errors_are_at_each_character() {
+        // Each character of text that isn't all whitespace is an error, at
+        // the character (WHATWG 13.2.6.4.10).
+        let result = parse_html5_full("<!DOCTYPE html><table>a b</table>");
+        let errors: Vec<(String, u32)> = result
+            .error_details
+            .iter()
+            .map(|e| (e.message(), e.location.column))
+            .collect();
+        let character = || "unexpected character".to_string();
+        assert_eq!(
+            errors,
+            vec![(character(), 23), (character(), 24), (character(), 25)]
+        );
     }
 }

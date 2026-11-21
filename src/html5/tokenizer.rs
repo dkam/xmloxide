@@ -189,7 +189,8 @@ pub struct Tokenizer<'a> {
     // Temporary buffer (character references, end-tag matching)
     temp_buffer: String,
     // Output queue – tokens waiting to be returned (FIFO)
-    pending_tokens: VecDeque<Token>,
+    // Tokens ready to return, each with the byte offset at which it began.
+    pending_tokens: VecDeque<(Token, usize)>,
     // Error tracking
     errors: Vec<TokenizerError>,
     // Last emitted start tag name (for appropriate end tag checks)
@@ -201,9 +202,12 @@ pub struct Tokenizer<'a> {
     allow_cdata: bool,
     // Most attributes a tag may have, and whether a tag has had more.
     max_attributes: Option<usize>,
+    // Most errors to record.
+    max_errors: Option<usize>,
     attribute_limit_exceeded: bool,
-    // Where the tokens in `pending_tokens` began: the input position when the
-    // tokenizer started producing them. Tokens produced together share it.
+    // Where the tokens being produced began: the input position when the
+    // tokenizer started producing them. Tokens produced together share it,
+    // except the characters of a run of text, which begin where they are.
     pending_start: usize,
     // Where the token `next_token` last returned began.
     token_start: usize,
@@ -246,6 +250,7 @@ impl<'a> Tokenizer<'a> {
             char_ref_code: 0,
             allow_cdata: false,
             max_attributes: None,
+            max_errors: None,
             attribute_limit_exceeded: false,
             pending_start: 0,
             token_start: 0,
@@ -270,6 +275,12 @@ impl<'a> Tokenizer<'a> {
     /// The limit also bounds the cost of the duplicate-attribute check.
     pub fn set_max_attributes(&mut self, max: Option<usize>) {
         self.max_attributes = max;
+    }
+
+    /// Records at most `max` errors, the first; later ones are dropped.
+    /// `None` records them all.
+    pub fn set_max_errors(&mut self, max: Option<usize>) {
+        self.max_errors = max;
     }
 
     /// Whether a tag has had more attributes than the limit allows.
@@ -325,14 +336,14 @@ impl<'a> Tokenizer<'a> {
     #[allow(clippy::too_many_lines)]
     pub fn next_token(&mut self) -> Token {
         // Drain pending queue first (character reference expansions, etc.)
-        if let Some(tok) = self.pending_tokens.pop_front() {
-            self.token_start = self.pending_start;
+        if let Some((tok, start)) = self.pending_tokens.pop_front() {
+            self.token_start = start;
             return tok;
         }
         self.pending_start = self.pos;
         loop {
-            if let Some(tok) = self.pending_tokens.pop_front() {
-                self.token_start = self.pending_start;
+            if let Some((tok, start)) = self.pending_tokens.pop_front() {
+                self.token_start = start;
                 return tok;
             }
             match self.state {
@@ -526,26 +537,34 @@ impl<'a> Tokenizer<'a> {
 
     /// Push a parse error, at the character the tokenizer is looking at.
     fn emit_error(&mut self, code: &'static str) {
+        if self.max_errors.is_some_and(|max| self.errors.len() >= max) {
+            return;
+        }
         self.errors.push(TokenizerError {
             code,
             span: self.char_start,
         });
     }
 
+    /// Queues a token, which began where the tokenizer started producing it.
+    fn queue(&mut self, token: Token) {
+        self.pending_tokens.push_back((token, self.pending_start));
+    }
+
     /// Emit a character token (pushes to pending queue).
     fn emit_char(&mut self, ch: char) {
-        self.pending_tokens.push_back(Token::Character(ch));
+        self.queue(Token::Character(ch));
     }
 
     /// Emit EOF.
     fn emit_eof(&mut self) {
-        self.pending_tokens.push_back(Token::Eof);
+        self.queue(Token::Eof);
     }
 
     /// Emit the current comment token.
     fn emit_comment(&mut self) {
         let comment = std::mem::take(&mut self.current_comment);
-        self.pending_tokens.push_back(Token::Comment(comment));
+        self.queue(Token::Comment(comment));
     }
 
     /// Emit the current tag token (start or end).
@@ -558,29 +577,32 @@ impl<'a> Tokenizer<'a> {
             if !self.current_tag_attrs.is_empty() {
                 self.emit_error("end-tag-with-attributes");
             }
-            self.pending_tokens.push_back(Token::EndTag {
+            let token = Token::EndTag {
                 name: std::mem::take(&mut self.current_tag_name),
-            });
+            };
+            self.queue(token);
         } else {
             let name = std::mem::take(&mut self.current_tag_name);
             self.last_start_tag_name = Some(name.clone());
-            self.pending_tokens.push_back(Token::StartTag {
+            let token = Token::StartTag {
                 name,
                 attributes: std::mem::take(&mut self.current_tag_attrs),
                 self_closing: self.current_tag_self_closing,
-            });
+            };
+            self.queue(token);
         }
         self.current_tag_self_closing = false;
     }
 
     /// Emit the current DOCTYPE token.
     fn emit_doctype(&mut self) {
-        self.pending_tokens.push_back(Token::Doctype {
+        let token = Token::Doctype {
             name: self.current_doctype_name.take(),
             public_id: self.current_doctype_public_id.take(),
             system_id: self.current_doctype_system_id.take(),
             force_quirks: self.current_doctype_force_quirks,
-        });
+        };
+        self.queue(token);
         self.current_doctype_force_quirks = false;
     }
 
@@ -661,7 +683,7 @@ impl<'a> Tokenizer<'a> {
         } else {
             // Emit each char individually.
             for ch in buf.chars() {
-                self.pending_tokens.push_back(Token::Character(ch));
+                self.queue(Token::Character(ch));
             }
         }
     }
@@ -689,8 +711,9 @@ impl<'a> Tokenizer<'a> {
             // All bytes in start..i are safe plain text (no null, no < or &).
             // Because we only break on ASCII bytes and skip non-ASCII bytes,
             // start..i is always a valid UTF-8 slice boundary.
-            for c in self.input[start..i].chars() {
-                self.pending_tokens.push_back(Token::Character(c));
+            for (offset, c) in self.input[start..i].char_indices() {
+                self.pending_tokens
+                    .push_back((Token::Character(c), start + offset));
             }
             self.pos = i;
             return;
@@ -3096,13 +3119,14 @@ mod tests {
     #[test]
     fn test_token_start() {
         // Offsets are into the input with CRLF normalized to LF.
-        let mut tok = Tokenizer::new("a<b>\r\n<!--c-->");
-        assert_eq!(tok.input(), "a<b>\n<!--c-->");
+        let mut tok = Tokenizer::new("ab<b>\r\n<!--c-->");
+        assert_eq!(tok.input(), "ab<b>\n<!--c-->");
         let mut starts = Vec::new();
         while tok.next_token() != Token::Eof {
             starts.push(tok.token_start());
         }
-        assert_eq!(starts, vec![0, 1, 4, 5]);
+        // Each character of a run of text starts where it is.
+        assert_eq!(starts, vec![0, 1, 2, 5, 6]);
     }
 
     #[test]
