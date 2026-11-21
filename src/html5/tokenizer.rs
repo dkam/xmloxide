@@ -535,6 +535,12 @@ impl<'a> Tokenizer<'a> {
     fn emit_current_tag(&mut self) {
         self.finish_current_attr();
         if self.current_tag_is_end {
+            if self.current_tag_self_closing {
+                self.emit_error("end-tag-with-trailing-solidus");
+            }
+            if !self.current_tag_attrs.is_empty() {
+                self.emit_error("end-tag-with-attributes");
+            }
             self.pending_tokens.push_back(Token::EndTag {
                 name: std::mem::take(&mut self.current_tag_name),
             });
@@ -1521,6 +1527,19 @@ impl<'a> Tokenizer<'a> {
     }
 
     // 13.2.5.33 Attribute name state
+    /// On leaving the attribute name state, an attribute with the name of
+    /// one already on the tag is a parse error (WHATWG 13.2.5.33). It is
+    /// dropped when the attribute is finished.
+    fn leave_attribute_name(&mut self) {
+        if self
+            .current_tag_attrs
+            .iter()
+            .any(|a| a.name == self.current_attr_name)
+        {
+            self.emit_error("duplicate-attribute");
+        }
+    }
+
     fn state_attribute_name(&mut self) {
         // Fast path: scan ahead for ASCII lowercase attribute name bytes.
         let bytes = self.input.as_bytes();
@@ -1555,10 +1574,12 @@ impl<'a> Tokenizer<'a> {
 
         match self.consume() {
             Some(c @ ('\t' | '\n' | '\x0C' | ' ' | '/' | '>')) => {
+                self.leave_attribute_name();
                 self.reconsume(c);
                 self.state = State::AfterAttributeName;
             }
             Some('=') => {
+                self.leave_attribute_name();
                 self.state = State::BeforeAttributeValue;
             }
             Some('\0') => {
@@ -1570,6 +1591,7 @@ impl<'a> Tokenizer<'a> {
                 self.current_attr_name.push(c);
             }
             None => {
+                self.leave_attribute_name();
                 self.reconsume('\0'); // will be handled by after-attr
                 self.pos = self.input.len(); // stay at EOF
                 self.state = State::AfterAttributeName;
@@ -3057,6 +3079,25 @@ mod tests {
             starts.push(tok.token_start());
         }
         assert_eq!(starts, vec![0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn test_duplicate_attribute_is_an_error() {
+        // Reported when the duplicate's name ends (WHATWG 13.2.5.33), at the
+        // character after it, as html5lib-tests expect.
+        assert_eq!(
+            error_spans("<x x=1 x=2 X=3>"),
+            vec![("duplicate-attribute", 8), ("duplicate-attribute", 12)]
+        );
+        assert_eq!(tokenize_errors("<a a a>"), vec!["duplicate-attribute"]);
+        assert_eq!(
+            tokenize_errors("</x x x>"),
+            vec!["duplicate-attribute", "end-tag-with-attributes"]
+        );
+        assert_eq!(
+            tokenize_errors("</x/>"),
+            vec!["end-tag-with-trailing-solidus"]
+        );
     }
 
     #[test]
