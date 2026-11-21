@@ -129,10 +129,7 @@ impl HtmlParseOptions {
     ///
     /// By default, a document whose input has no DOCTYPE gets HTML 4.0
     /// Transitional's, as libxml2 gives it. When enabled, it gets none, as
-    /// with libxml2's `HTML_PARSE_NODEFDTD`. (With [`no_implied`], it gets
-    /// none either way.) Disabled by default.
-    ///
-    /// [`no_implied`]: HtmlParseOptions::no_implied
+    /// with libxml2's `HTML_PARSE_NODEFDTD`. Disabled by default.
     #[must_use]
     pub fn no_default_doctype(mut self, yes: bool) -> Self {
         self.no_default_doctype = yes;
@@ -311,9 +308,9 @@ struct HtmlParser<'a> {
     open_elements: Vec<(NodeId, String)>,
     /// Set when a fatal error (e.g. depth limit) occurs; stops parsing.
     fatal_error: Option<ParseError>,
-    /// The `<head>` a start tag before the body opened, which stays even if
-    /// it ends up empty, as libxml2 keeps it.
-    head_from_tag: Option<NodeId>,
+    /// How many misplaced `<head>` start tags were dropped, whose end tags
+    /// are dropped too (libxml2's `ctxt->depth`).
+    dropped_heads: usize,
 }
 
 impl<'a> HtmlParser<'a> {
@@ -327,7 +324,7 @@ impl<'a> HtmlParser<'a> {
             options: options.clone(),
             open_elements: Vec::new(),
             fatal_error: None,
-            head_from_tag: None,
+            dropped_heads: 0,
         }
     }
 
@@ -371,7 +368,7 @@ impl<'a> HtmlParser<'a> {
         }
 
         // Add default DOCTYPE if none was in the input and not disabled
-        if !has_doctype && !self.options.no_implied && !self.options.no_default_doctype {
+        if !has_doctype && !self.options.no_default_doctype {
             let doctype_id = self.doc.create_node(NodeKind::DocumentType {
                 name: "html".to_string(),
                 public_id: Some("-//W3C//DTD HTML 4.0 Transitional//EN".to_string()),
@@ -382,10 +379,6 @@ impl<'a> HtmlParser<'a> {
             let root = self.doc.root();
             self.doc.prepend_child(root, doctype_id);
         }
-
-        // Remove empty <head> elements the parser implied (libxml2 doesn't
-        // imply one it has nothing to put in)
-        self.remove_empty_heads();
 
         Ok(std::mem::take(&mut self.doc))
     }
@@ -464,26 +457,6 @@ impl<'a> HtmlParser<'a> {
         head_id
     }
 
-    /// Removes empty `<head>` elements from the document tree, except one
-    /// from a start tag (`head_from_tag`).
-    fn remove_empty_heads(&mut self) {
-        let root = self.doc.root();
-        for html_id in self.doc.children(root).collect::<Vec<_>>() {
-            if !matches!(&self.doc.node(html_id).kind, NodeKind::Element { name, .. } if name == "html")
-            {
-                continue;
-            }
-            for child_id in self.doc.children(html_id).collect::<Vec<_>>() {
-                if matches!(&self.doc.node(child_id).kind, NodeKind::Element { name, .. } if name == "head")
-                    && self.doc.first_child(child_id).is_none()
-                    && self.head_from_tag != Some(child_id)
-                {
-                    self.doc.remove_node(child_id);
-                }
-            }
-        }
-    }
-
     /// Returns the current insertion point (the innermost open element, or
     /// the document root).
     fn current_parent(&self) -> NodeId {
@@ -532,17 +505,7 @@ impl<'a> HtmlParser<'a> {
                     self.ensure_body();
                 }
                 let parent = self.current_parent();
-                // Merge with previous text node if possible
-                if let Some(last_child) = self.doc.last_child(parent) {
-                    if let NodeKind::Text { content } = &mut self.doc.node_mut(last_child).kind {
-                        content.push('<');
-                        continue;
-                    }
-                }
-                let text_id = self.doc.create_node(NodeKind::Text {
-                    content: "<".to_string(),
-                });
-                self.doc.append_child(parent, text_id);
+                self.append_text(parent, "<".to_string());
             } else {
                 self.parse_text();
             }
@@ -647,13 +610,17 @@ impl<'a> HtmlParser<'a> {
                 return;
             }
             if lower_tag == "head" {
-                let head_id = self.ensure_head();
-                if !self.html_has_child("body") {
-                    self.head_from_tag = Some(head_id);
-                }
-                self.merge_attributes(head_id, attributes);
-                // Push head to open_elements so child elements go inside it
-                if !self.open_elements.iter().any(|(_, t)| t == "head") {
+                // With anything but <html> open, or after the body, a <head>
+                // is misplaced, and libxml2's htmlParseStartTag drops it.
+                if self.html_has_child("body")
+                    || self.open_elements.iter().any(|(_, t)| t != "html")
+                {
+                    self.push_warning("misplaced <head> tag".to_string());
+                    self.dropped_heads += 1;
+                } else {
+                    let head_id = self.ensure_head();
+                    self.merge_attributes(head_id, attributes);
+                    // Push head to open_elements so child elements go inside it
                     self.open_elements.push((head_id, "head".to_string()));
                 }
                 self.input.decrement_depth();
@@ -802,6 +769,10 @@ impl<'a> HtmlParser<'a> {
         // Void elements should not have end tags; ignore them.
         if is_void_element(&lower_tag) {
             self.push_warning(format!("end tag for void element </{lower_tag}> ignored"));
+            return;
+        }
+        if lower_tag == "head" && self.dropped_heads > 0 {
+            self.dropped_heads -= 1;
             return;
         }
 
@@ -1412,8 +1383,12 @@ mod tests {
         parse_html(input).unwrap_or_else(|e| panic!("parse failed: {e}"))
     }
 
+    /// Parses without implied elements or the default DOCTYPE, so that the
+    /// input's first node is the document's first child.
     fn parse_no_implied(input: &str) -> Document {
-        let opts = HtmlParseOptions::default().no_implied(true);
+        let opts = HtmlParseOptions::default()
+            .no_implied(true)
+            .no_default_doctype(true);
         parse_html_with_options(input, &opts).unwrap_or_else(|e| panic!("parse failed: {e}"))
     }
 
@@ -1470,7 +1445,7 @@ mod tests {
         let html = doc.root_element().unwrap();
         assert_eq!(doc.node_name(html), Some("html"));
 
-        // Should have body child (empty head is removed)
+        // Should have body child (and no head, with nothing to put in it)
         let children: Vec<_> = doc.children(html).collect();
         assert_ne!(children, [] as [crate::tree::NodeId; 0]);
         // Body should contain the <p>
@@ -1726,8 +1701,7 @@ mod tests {
     fn test_no_blanks_option() {
         let opts = HtmlParseOptions::default().no_blanks(true).no_implied(true);
         let doc = parse_html_with_options("<div>  \n  <p>text</p>  \n  </div>", &opts).unwrap();
-        let root = doc.root();
-        let div = doc.first_child(root).unwrap();
+        let div = doc.root_element().unwrap();
         // With no_blanks, whitespace-only text nodes are stripped
         let children: Vec<_> = doc.children(div).collect();
         assert_eq!(children.len(), 1);
@@ -1901,8 +1875,48 @@ mod tests {
     }
 
     #[test]
+    fn test_no_implied_keeps_the_default_doctype() {
+        // libxml2 leaves the DOCTYPE out for HTML_PARSE_NODEFDTD alone.
+        let opts = HtmlParseOptions::default().no_implied(true);
+        let doc = parse_html_with_options("<p>x</p>", &opts).unwrap();
+        let first = doc.first_child(doc.root()).unwrap();
+        assert!(matches!(
+            doc.node(first).kind,
+            NodeKind::DocumentType { .. }
+        ));
+    }
+
+    #[test]
+    fn test_misplaced_head_is_ignored_with_a_warning() {
+        // A <head> with anything but <html> open, as libxml2's
+        // htmlParseStartTag reports it.
+        for input in ["<p>x</p><head></head>", "<title>t</title><head></head><p>x"] {
+            let doc = parse(input);
+            let messages: Vec<_> = doc.diagnostics.iter().map(|d| d.message.as_str()).collect();
+            assert!(
+                messages.contains(&"misplaced <head> tag"),
+                "{input}: {messages:?}"
+            );
+        }
+        let doc = parse("<head></head><p>x");
+        assert!(doc
+            .diagnostics
+            .iter()
+            .all(|d| d.message != "misplaced <head> tag"));
+        // The end tag of a <head> it dropped is dropped too, unreported.
+        let doc = parse("<p>x</p><head></head>");
+        assert!(doc
+            .diagnostics
+            .iter()
+            .all(|d| !d.message.contains("</head>")));
+    }
+
+    #[test]
     fn test_empty_head_is_kept_only_from_a_start_tag_before_the_body() {
-        assert_eq!(html_child_names(&parse("<head></head><p>x")), ["head", "body"]);
+        assert_eq!(
+            html_child_names(&parse("<head></head><p>x")),
+            ["head", "body"]
+        );
         assert_eq!(html_child_names(&parse("<p>x</p><head></head>")), ["body"]);
         assert_eq!(html_child_names(&parse("<p>x")), ["body"]);
     }
