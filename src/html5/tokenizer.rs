@@ -199,6 +199,9 @@ pub struct Tokenizer<'a> {
     // Whether the adjusted current node is in a foreign (non-HTML) namespace.
     // Set by the tree builder; controls CDATA section handling.
     allow_cdata: bool,
+    // Most attributes a tag may have, and whether a tag has had more.
+    max_attributes: Option<usize>,
+    attribute_limit_exceeded: bool,
     // Where the tokens in `pending_tokens` began: the input position when the
     // tokenizer started producing them. Tokens produced together share it.
     pending_start: usize,
@@ -242,6 +245,8 @@ impl<'a> Tokenizer<'a> {
             last_start_tag_name: None,
             char_ref_code: 0,
             allow_cdata: false,
+            max_attributes: None,
+            attribute_limit_exceeded: false,
             pending_start: 0,
             token_start: 0,
             char_start: 0,
@@ -258,6 +263,18 @@ impl<'a> Tokenizer<'a> {
     /// recently returned by [`Tokenizer::next_token`] began.
     pub fn token_start(&self) -> usize {
         self.token_start
+    }
+
+    /// Limits how many attributes a tag may have. Attributes past the limit
+    /// are dropped, and [`Tokenizer::attribute_limit_exceeded`] becomes true.
+    /// The limit also bounds the cost of the duplicate-attribute check.
+    pub fn set_max_attributes(&mut self, max: Option<usize>) {
+        self.max_attributes = max;
+    }
+
+    /// Whether a tag has had more attributes than the limit allows.
+    pub fn attribute_limit_exceeded(&self) -> bool {
+        self.attribute_limit_exceeded
     }
 
     /// Returns a reference to the errors collected so far.
@@ -602,6 +619,13 @@ impl<'a> Tokenizer<'a> {
         }
         let name = std::mem::take(&mut self.current_attr_name);
         let value = std::mem::take(&mut self.current_attr_value);
+        if self
+            .max_attributes
+            .is_some_and(|max| self.current_tag_attrs.len() >= max)
+        {
+            self.attribute_limit_exceeded = true;
+            return;
+        }
         // The spec says duplicate attributes are parse errors; keep first.
         if !self.current_tag_attrs.iter().any(|a| a.name == name) {
             self.current_tag_attrs.push(Attribute { name, value });

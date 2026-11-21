@@ -33,6 +33,7 @@
 //! let opts = Html5ParseOptions {
 //!     scripting: false,
 //!     fragment_context: Some("body".to_string()),
+//!     ..Default::default()
 //! };
 //! let doc = parse_html5_with_options("<p>fragment</p>", &opts).unwrap();
 //! ```
@@ -79,6 +80,6 @@ pub mod tokenizer;
 pub(crate) mod tree_builder;
 
 pub use tree_builder::{
-    parse_html5, parse_html5_full, parse_html5_full_with_options, parse_html5_with_options,
-    Html5ParseOptions, Html5ParseResult,
+    doctype_quirks_mode, parse_html5, parse_html5_full, parse_html5_full_with_options,
+    parse_html5_with_options, Html5Limit, Html5ParseOptions, Html5ParseResult, QuirksMode,
 };

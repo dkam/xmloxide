@@ -394,6 +394,7 @@ fn bench_parse_html5_fragment(c: &mut Criterion) {
     let opts = Html5ParseOptions {
         scripting: false,
         fragment_context: Some("body".to_string()),
+        ..Default::default()
     };
     c.bench_function("parse_html5_fragment", |b| {
         b.iter(|| parse_html5_with_options(black_box(&html), &opts));

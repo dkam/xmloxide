@@ -17,6 +17,7 @@ fuzz_target!(|data: &[u8]| {
         let opts = Html5ParseOptions {
             scripting: data.first().is_some_and(|b| b & 1 != 0),
             fragment_context: Some(ctx.to_string()),
+            ..Default::default()
         };
         let _ = parse_html5_with_options(s, &opts);
     }

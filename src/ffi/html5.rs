@@ -88,6 +88,7 @@ pub unsafe extern "C" fn xmloxide_parse_html5_fragment(
     let opts = Html5ParseOptions {
         scripting: false,
         fragment_context: Some(ctx.to_string()),
+        ..Default::default()
     };
     match parse_html5_with_options(s, &opts) {
         Ok(doc) => Box::into_raw(Box::new(doc)),

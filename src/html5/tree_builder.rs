@@ -46,11 +46,16 @@ enum InsertionMode {
 // Quirks mode
 // ---------------------------------------------------------------------------
 
-/// Document compatibility mode determined by the DOCTYPE.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QuirksMode {
+/// Document compatibility mode determined by the DOCTYPE (WHATWG
+/// §13.2.6.4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuirksMode {
+    /// Standards mode.
+    #[default]
     NoQuirks,
+    /// Quirks mode: no DOCTYPE, or a legacy one.
     Quirks,
+    /// Limited-quirks ("almost standards") mode.
     LimitedQuirks,
 }
 
@@ -119,6 +124,25 @@ const QUIRKS_EXACT: &[&str] = &[
     "-/w3c/dtd html 4.0 transitional/en",
     "html",
 ];
+
+/// The compatibility mode a DOCTYPE puts a document in (WHATWG
+/// §13.2.6.4.1), for a DOCTYPE without the force-quirks flag: for instance,
+/// to find the mode of a document a fragment is parsed for.
+///
+/// ```
+/// use xmloxide::html5::{doctype_quirks_mode, QuirksMode};
+///
+/// assert_eq!(doctype_quirks_mode("html", None, None), QuirksMode::NoQuirks);
+/// assert_eq!(doctype_quirks_mode("svg", None, None), QuirksMode::Quirks);
+/// ```
+#[must_use]
+pub fn doctype_quirks_mode(
+    name: &str,
+    public_id: Option<&str>,
+    system_id: Option<&str>,
+) -> QuirksMode {
+    determine_quirks_mode(name, public_id, system_id, false)
+}
 
 /// Determine quirks mode from a DOCTYPE token per WHATWG §13.2.6.4.1.
 fn determine_quirks_mode(
@@ -255,6 +279,33 @@ pub struct Html5ParseOptions {
     /// and namespace-prefixed names for foreign contexts (e.g. `"svg svg"`,
     /// `"math mi"`).
     pub fragment_context: Option<String>,
+    /// For fragment parsing: the compatibility mode of the context element's
+    /// document, which the fragment is parsed in (WHATWG §13.4, step 2).
+    pub fragment_quirks_mode: QuirksMode,
+    /// For fragment parsing: whether the context element is a `form` or has
+    /// a `form` ancestor. A `<form>` in the fragment is then ignored, as
+    /// forms don't nest (step 11).
+    pub fragment_form_ancestor: bool,
+    /// For fragment parsing: the context element's `encoding` attribute. A
+    /// `MathML` `annotation-xml` context whose encoding is `text/html` or
+    /// `application/xhtml+xml` is an HTML integration point.
+    pub fragment_context_encoding: Option<String>,
+    /// Stop parsing when a tag has more than this many attributes, and
+    /// report [`Html5Limit::Attributes`]. `None` sets no limit.
+    pub max_attributes: Option<usize>,
+    /// Stop parsing when more than this many elements are open at once, and
+    /// report [`Html5Limit::TreeDepth`]. `None` sets no limit.
+    pub max_tree_depth: Option<usize>,
+}
+
+/// A limit from [`Html5ParseOptions`] that the input exceeded, which stopped
+/// the parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Html5Limit {
+    /// A tag had more attributes than `max_attributes`.
+    Attributes,
+    /// More elements were open than `max_tree_depth`.
+    TreeDepth,
 }
 
 /// Result of HTML5 parsing, containing the document tree and any parse errors.
@@ -280,6 +331,11 @@ pub struct Html5ParseResult {
     ///
     /// These are non-fatal diagnostics — the document tree is still complete.
     pub errors: Vec<ParseDiagnostic>,
+    /// The document's compatibility mode, as its DOCTYPE determined it.
+    pub quirks_mode: QuirksMode,
+    /// The limit that stopped the parse early, if one did. The document is
+    /// then incomplete.
+    pub limit_exceeded: Option<Html5Limit>,
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +376,7 @@ pub fn parse_html5(input: &str) -> Result<Document, ParseError> {
 /// let opts = Html5ParseOptions {
 ///     scripting: false,
 ///     fragment_context: Some("body".to_string()),
+///     ..Default::default()
 /// };
 /// let doc = parse_html5_with_options("<p>fragment</p>", &opts).unwrap();
 /// ```
@@ -352,7 +409,8 @@ pub fn parse_html5_full(input: &str) -> Html5ParseResult {
 /// Parses an HTML5 string with the given options, returning the document tree
 /// and all parse errors.
 pub fn parse_html5_full_with_options(input: &str, options: &Html5ParseOptions) -> Html5ParseResult {
-    let tokenizer = Tokenizer::new(input);
+    let mut tokenizer = Tokenizer::new(input);
+    tokenizer.set_max_attributes(options.max_attributes);
     let mut builder = TreeBuilder::new(tokenizer, options);
     builder.run();
 
@@ -385,9 +443,12 @@ pub fn parse_html5_full_with_options(input: &str, options: &Html5ParseOptions) -
         });
     }
 
+    let limit_exceeded = builder.limit_exceeded();
     Html5ParseResult {
         document: builder.doc,
         errors,
+        quirks_mode: builder.quirks_mode,
+        limit_exceeded,
     }
 }
 
@@ -843,6 +904,9 @@ struct TreeBuilder<'a> {
     quirks_mode: QuirksMode,
     /// For fragment parsing: the context element name and namespace.
     fragment_context: Option<(String, Namespace)>,
+    fragment_form_ancestor: bool,
+    fragment_context_encoding: Option<String>,
+    max_tree_depth: Option<usize>,
     #[allow(dead_code)]
     errors: Vec<TreeBuildError>,
 }
@@ -874,8 +938,15 @@ impl<'a> TreeBuilder<'a> {
             template_modes: Vec::new(),
             pending_table_chars: Vec::new(),
             skip_next_lf: false,
-            quirks_mode: QuirksMode::NoQuirks,
+            quirks_mode: if fragment_context.is_some() {
+                options.fragment_quirks_mode
+            } else {
+                QuirksMode::NoQuirks
+            },
             fragment_context,
+            fragment_form_ancestor: options.fragment_form_ancestor,
+            fragment_context_encoding: options.fragment_context_encoding.clone(),
+            max_tree_depth: options.max_tree_depth,
             errors: Vec::new(),
         }
     }
@@ -950,8 +1021,14 @@ impl<'a> TreeBuilder<'a> {
             });
             self.doc.append_child(html_id, ctx_id);
 
-            let is_html_integration = ctx_ns == Namespace::Svg
-                && matches!(ctx_name.as_str(), "foreignObject" | "desc" | "title");
+            let is_html_integration = (ctx_ns == Namespace::Svg
+                && matches!(ctx_name.as_str(), "foreignObject" | "desc" | "title"))
+                || (ctx_ns == Namespace::MathMl
+                    && ctx_name == "annotation-xml"
+                    && self.fragment_context_encoding.as_deref().is_some_and(|e| {
+                        e.eq_ignore_ascii_case("text/html")
+                            || e.eq_ignore_ascii_case("application/xhtml+xml")
+                    }));
             self.open_elements.push(StackEntry {
                 node_id: ctx_id,
                 name: ctx_name.clone(),
@@ -964,8 +1041,35 @@ impl<'a> TreeBuilder<'a> {
         // (reset_insertion_mode uses fragment_context for the "last" node case)
         self.reset_insertion_mode();
 
+        // Step 11: The form element pointer is the context's nearest form.
+        // That form isn't in this document, so a detached stand-in makes
+        // `<form>` in the fragment be ignored, and is never in scope.
+        if self.fragment_form_ancestor || (ctx_name == "form" && ctx_ns == Namespace::Html) {
+            let form = self.doc.create_node(NodeKind::Element {
+                name: "form".to_string(),
+                prefix: None,
+                namespace: None,
+                attributes: Vec::new(),
+            });
+            self.form_pointer = Some(form);
+        }
+
         // Step 12: Set frameset_ok to false.
         self.frameset_ok = false;
+    }
+
+    /// The limit the input has exceeded so far, if any.
+    fn limit_exceeded(&self) -> Option<Html5Limit> {
+        if self.tokenizer.attribute_limit_exceeded() {
+            Some(Html5Limit::Attributes)
+        } else if self
+            .max_tree_depth
+            .is_some_and(|max| self.open_elements.len() > max)
+        {
+            Some(Html5Limit::TreeDepth)
+        } else {
+            None
+        }
     }
 
     fn run(&mut self) {
@@ -973,6 +1077,9 @@ impl<'a> TreeBuilder<'a> {
             self.initialize_fragment();
         }
         loop {
+            if self.limit_exceeded().is_some() {
+                return;
+            }
             // Inform the tokenizer whether the adjusted current node is in
             // a foreign namespace (controls CDATA section handling).
             let in_foreign = self
@@ -4701,5 +4808,128 @@ mod tests {
         assert_eq!(doc.node_name(select), Some("select"));
         let children = child_names(&doc, select);
         assert_eq!(children, vec!["option", "option"]);
+    }
+
+    fn parse_with(input: &str, options: &Html5ParseOptions) -> Html5ParseResult {
+        parse_html5_full_with_options(input, options)
+    }
+
+    #[test]
+    fn test_quirks_mode_follows_doctype() {
+        let quirks = |input| parse_html5_full(input).quirks_mode;
+        assert_eq!(quirks("<!DOCTYPE html><p>"), QuirksMode::NoQuirks);
+        assert_eq!(quirks("<p>"), QuirksMode::Quirks);
+        assert_eq!(
+            quirks(r#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "x">"#),
+            QuirksMode::LimitedQuirks
+        );
+    }
+
+    #[test]
+    fn test_max_attributes() {
+        let input = r#"<div id="i" class="c" title="t"><img src="s" alt="a"></div>"#;
+        let limit = |max| {
+            let options = Html5ParseOptions {
+                max_attributes: Some(max),
+                ..Default::default()
+            };
+            parse_with(input, &options).limit_exceeded
+        };
+        assert_eq!(limit(2), Some(Html5Limit::Attributes));
+        assert_eq!(limit(0), Some(Html5Limit::Attributes));
+        assert_eq!(limit(3), None);
+        assert_eq!(parse_html5_full(input).limit_exceeded, None);
+    }
+
+    #[test]
+    fn test_max_attributes_counts_duplicates() {
+        let options = Html5ParseOptions {
+            max_attributes: Some(1),
+            ..Default::default()
+        };
+        let result = parse_with("<p a=1 a=2>", &options);
+        assert_eq!(result.limit_exceeded, Some(Html5Limit::Attributes));
+    }
+
+    #[test]
+    fn test_max_tree_depth() {
+        // html, body and eight divs are open at the end.
+        let input = format!("<!DOCTYPE html><html><body>{}", "<div>".repeat(8));
+        let limit = |max| {
+            let options = Html5ParseOptions {
+                max_tree_depth: Some(max),
+                ..Default::default()
+            };
+            parse_with(&input, &options).limit_exceeded
+        };
+        assert_eq!(limit(9), Some(Html5Limit::TreeDepth));
+        assert_eq!(limit(10), None);
+    }
+
+    #[test]
+    fn test_fragment_form_ancestor_ignores_nested_form() {
+        let options = Html5ParseOptions {
+            fragment_context: Some("span".to_string()),
+            fragment_form_ancestor: true,
+            ..Default::default()
+        };
+        let result = parse_with("<form>x</form>", &options);
+        let html = result.document.root_element().unwrap();
+        assert_eq!(child_names(&result.document, html), vec!["#text"]);
+
+        let options = Html5ParseOptions {
+            fragment_context: Some("span".to_string()),
+            ..Default::default()
+        };
+        let result = parse_with("<form>x</form>", &options);
+        let html = result.document.root_element().unwrap();
+        assert_eq!(child_names(&result.document, html), vec!["form"]);
+    }
+
+    #[test]
+    fn test_fragment_quirks_mode() {
+        // In quirks mode a table doesn't close an open p.
+        let parse_in = |mode| {
+            let options = Html5ParseOptions {
+                fragment_context: Some("body".to_string()),
+                fragment_quirks_mode: mode,
+                ..Default::default()
+            };
+            let result = parse_with("<p><table>", &options);
+            assert_eq!(result.quirks_mode, mode);
+            let html = result.document.root_element().unwrap();
+            let p = result.document.first_child(html).unwrap();
+            child_names(&result.document, p)
+        };
+        assert_eq!(parse_in(QuirksMode::Quirks), vec!["table"]);
+        assert!(parse_in(QuirksMode::NoQuirks).is_empty());
+    }
+
+    #[test]
+    fn test_fragment_annotation_xml_encoding() {
+        // An annotation-xml context with an HTML encoding is an HTML
+        // integration point, so <mi> in it is an HTML element.
+        let namespace_of_mi = |encoding: Option<&str>| {
+            let options = Html5ParseOptions {
+                fragment_context: Some("math annotation-xml".to_string()),
+                fragment_context_encoding: encoding.map(str::to_string),
+                ..Default::default()
+            };
+            let result = parse_with("<mi>x</mi>", &options);
+            let doc = &result.document;
+            let mi = doc
+                .descendants(doc.root())
+                .find(|id| doc.node_name(*id) == Some("mi"))
+                .unwrap();
+            match &doc.node(mi).kind {
+                NodeKind::Element { namespace, .. } => namespace.clone(),
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(namespace_of_mi(Some("text/html")), None);
+        assert_eq!(
+            namespace_of_mi(Some("MathML-Presentation")).as_deref(),
+            Some("http://www.w3.org/1998/Math/MathML")
+        );
     }
 }

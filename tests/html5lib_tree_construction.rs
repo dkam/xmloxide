@@ -359,6 +359,7 @@ fn html5lib_tree_construction_suite() {
             let options = Html5ParseOptions {
                 scripting,
                 fragment_context: test.fragment_context.clone(),
+                ..Default::default()
             };
             let doc = match parse_html5_with_options(&test.data, &options) {
                 Ok(d) => d,
