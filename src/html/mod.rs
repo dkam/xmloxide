@@ -56,6 +56,9 @@ pub struct HtmlParseOptions {
     pub no_implied: bool,
     /// If true, suppress warning diagnostics.
     pub no_warnings: bool,
+    /// If true, do not add the default DOCTYPE to a document without one
+    /// (libxml2's `HTML_PARSE_NODEFDTD`).
+    pub no_default_doctype: bool,
 }
 
 impl Default for HtmlParseOptions {
@@ -65,6 +68,7 @@ impl Default for HtmlParseOptions {
             no_blanks: false,
             no_implied: false,
             no_warnings: false,
+            no_default_doctype: false,
         }
     }
 }
@@ -118,6 +122,20 @@ impl HtmlParseOptions {
     #[must_use]
     pub fn no_warnings(mut self, yes: bool) -> Self {
         self.no_warnings = yes;
+        self
+    }
+
+    /// Enables or disables the default DOCTYPE.
+    ///
+    /// By default, a document whose input has no DOCTYPE gets HTML 4.0
+    /// Transitional's, as libxml2 gives it. When enabled, it gets none, as
+    /// with libxml2's `HTML_PARSE_NODEFDTD`. (With [`no_implied`], it gets
+    /// none either way.) Disabled by default.
+    ///
+    /// [`no_implied`]: HtmlParseOptions::no_implied
+    #[must_use]
+    pub fn no_default_doctype(mut self, yes: bool) -> Self {
+        self.no_default_doctype = yes;
         self
     }
 }
@@ -349,7 +367,7 @@ impl<'a> HtmlParser<'a> {
         }
 
         // Add default DOCTYPE if none was in the input and not disabled
-        if !has_doctype && !self.options.no_implied {
+        if !has_doctype && !self.options.no_implied && !self.options.no_default_doctype {
             let doctype_id = self.doc.create_node(NodeKind::DocumentType {
                 name: "html".to_string(),
                 public_id: Some("-//W3C//DTD HTML 4.0 Transitional//EN".to_string()),
@@ -996,17 +1014,29 @@ impl<'a> HtmlParser<'a> {
                 let rest = text.split_off(ws_len);
                 if !text.is_empty() {
                     let parent = self.current_parent();
-                    let ws_id = self.doc.create_node(NodeKind::Text { content: text });
-                    self.doc.append_child(parent, ws_id);
+                    self.append_text(parent, text);
                 }
                 self.close_head_if_open();
                 self.ensure_body();
                 text = rest;
             }
             let parent = self.current_parent();
-            let text_id = self.doc.create_node(NodeKind::Text { content: text });
-            self.doc.append_child(parent, text_id);
+            self.append_text(parent, text);
         }
+    }
+
+    /// Appends `text` to `parent`: to its last child, if that is text (after
+    /// an end tag that closed nothing, say), as libxml2's SAX handler
+    /// merges adjacent character data, and otherwise as a new text node.
+    fn append_text(&mut self, parent: NodeId, text: String) {
+        if let Some(last) = self.doc.last_child(parent) {
+            if let NodeKind::Text { content } = self.doc.kind_mut(last) {
+                content.push_str(&text);
+                return;
+            }
+        }
+        let text_id = self.doc.create_node(NodeKind::Text { content: text });
+        self.doc.append_child(parent, text_id);
     }
 
     /// Returns true if `text`, about to be inserted at the current position,
@@ -1389,6 +1419,31 @@ mod tests {
         assert_eq!(doc.attribute(p, "title"), Some("naïve €"));
         assert_eq!(doc.attribute(p, "lang"), Some("ü"));
         assert_eq!(doc.text_content(p), "café");
+    }
+
+    #[test]
+    fn test_text_after_an_ignored_end_tag_joins_the_text_before_it() {
+        let doc = parse("<div>a</p>b</div>");
+        let body = doc.children(doc.root_element().unwrap()).last().unwrap();
+        let div = doc.first_child(body).unwrap();
+        let texts: Vec<_> = doc.children(div).map(|id| doc.node_text(id)).collect();
+        assert_eq!(texts, vec![Some("ab")]);
+    }
+
+    #[test]
+    fn test_no_default_doctype_option() {
+        let opts = HtmlParseOptions::default().no_default_doctype(true);
+        let doc = parse_html_with_options("<p>x</p>", &opts).unwrap();
+        let kinds: Vec<_> = doc
+            .children(doc.root())
+            .map(|id| doc.node_name(id))
+            .collect();
+        assert_eq!(kinds, vec![Some("html")]);
+        let doc = parse_html_with_options("<!DOCTYPE html><p>x</p>", &opts).unwrap();
+        assert!(matches!(
+            doc.node(doc.first_child(doc.root()).unwrap()).kind,
+            NodeKind::DocumentType { .. }
+        ));
     }
 
     #[test]
