@@ -59,6 +59,9 @@ pub(crate) struct XmlParser<'a, 'h> {
     pub(crate) events: Option<&'h mut dyn EventHandler>,
     /// How many of the input's diagnostics have been reported as events.
     reported: usize,
+    /// For a parser of an entity's replacement text, where the reference
+    /// is in the document: the location of its events.
+    reference: Option<SourceLocation>,
 }
 
 impl<'a> XmlParser<'a, '_> {
@@ -84,18 +87,20 @@ impl<'a> XmlParser<'a, '_> {
             entity_depth: 0,
             events: None,
             reported: 0,
+            reference: None,
         }
     }
 
-    /// Where the parser is in the input.
+    /// Where the parser is in the document: in an entity's replacement
+    /// text, at the reference.
     pub(crate) fn location(&self) -> SourceLocation {
-        self.input.location()
+        self.reference.unwrap_or_else(|| self.input.location())
     }
 
     /// Reports `event`, after any diagnostics not yet reported.
     fn emit(&mut self, event: Event<'_>) {
+        let location = self.location();
         if let Some(handler) = self.events.as_deref_mut() {
-            let location = self.input.location();
             report(
                 handler,
                 &self.input.diagnostics,
@@ -115,6 +120,7 @@ impl<'a> XmlParser<'a, '_> {
 
     /// Reports the end of `element`.
     fn emit_end_element(&mut self, element: NodeId) {
+        let location = self.location();
         let Some(handler) = self.events.as_deref_mut() else {
             return;
         };
@@ -130,7 +136,6 @@ impl<'a> XmlParser<'a, '_> {
                 prefix: prefix.as_deref(),
                 namespace: namespace.as_deref(),
             };
-            let location = self.input.location();
             report(
                 handler,
                 &self.input.diagnostics,
@@ -143,6 +148,7 @@ impl<'a> XmlParser<'a, '_> {
 
     /// Reports the entity reference `reference`.
     fn emit_entity_reference(&mut self, reference: NodeId) {
+        let location = self.location();
         let Some(handler) = self.events.as_deref_mut() else {
             return;
         };
@@ -151,7 +157,6 @@ impl<'a> XmlParser<'a, '_> {
                 name,
                 replacement: value.as_deref(),
             };
-            let location = self.input.location();
             report(
                 handler,
                 &self.input.diagnostics,
@@ -1314,9 +1319,11 @@ impl<'a> XmlParser<'a, '_> {
         sub.attr_types = std::mem::take(&mut self.attr_types);
         sub.attr_defaults = std::mem::take(&mut self.attr_defaults);
         std::mem::swap(&mut sub.ns, &mut self.ns);
-        // The sub-parser reports the replacement text's events.
+        // The sub-parser reports the replacement text's events, located at
+        // the reference.
         self.report_diagnostics();
         sub.events = self.events.take();
+        sub.reference = Some(self.location());
 
         let sub_root = sub.doc.root();
         let result = sub.parse_content_fragment(sub_root);

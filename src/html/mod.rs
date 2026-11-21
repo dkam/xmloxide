@@ -697,7 +697,15 @@ impl<'a> HtmlParser<'a, '_> {
         // Consume '>'
         if self.input.peek() == Some(b'>') {
             self.input.advance(1);
-        } else if !self.input.at_end() {
+        } else if self.input.at_end() {
+            // A tag the input ends in is unfinished, and libxml2 2.14's
+            // tokenizer drops it.
+            self.push_warning(format!(
+                "start tag <{lower_tag}> cut off by the end of input"
+            ));
+            self.input.decrement_depth();
+            return;
+        } else {
             self.push_warning(format!("expected '>' after tag <{lower_tag}>"));
             self.skip_to_gt();
         }
@@ -888,25 +896,17 @@ impl<'a> HtmlParser<'a, '_> {
             .rposition(|(_, name)| *name == lower_tag);
 
         if let Some(idx) = found {
-            // Pop everything above and including the matched element
-            // (auto-closing any intervening elements)
-            let count = self.open_elements.len() - idx;
-            for i in (0..count).rev() {
-                let stack_idx = idx + i;
-                if stack_idx < self.open_elements.len() {
-                    let (_, ref closed_tag) = self.open_elements[stack_idx];
-                    if *closed_tag != lower_tag {
-                        self.push_warning(format!(
-                            "implicitly closing <{closed_tag}> before </{lower_tag}>"
-                        ));
-                    }
+            // Close everything above and including the matched element,
+            // innermost first, each intervening one after a warning.
+            while let Some((_, closed_tag)) = self.open_elements.get(idx..).and_then(<[_]>::last) {
+                if *closed_tag != lower_tag {
+                    let message =
+                        format!("implicitly closing <{closed_tag}> before </{lower_tag}>");
+                    self.push_warning(message);
                 }
-            }
-            // Decrement depth for each element being closed
-            for _ in 0..count {
+                self.close_element();
                 self.input.decrement_depth();
             }
-            self.close_elements(idx);
         } else {
             // No matching open element — stray end tag
             self.push_warning(format!("stray end tag </{lower_tag}>"));
@@ -953,6 +953,11 @@ impl<'a> HtmlParser<'a, '_> {
                 lower_name.clone()
             };
 
+            // A repeated attribute is dropped: the first one counts, as in
+            // libxml2.
+            if attributes.iter().any(|a: &Attribute| a.name == lower_name) {
+                continue;
+            }
             attributes.push(Attribute {
                 name: lower_name,
                 value,
@@ -1984,6 +1989,46 @@ mod tests {
             doc.node(first).kind,
             NodeKind::DocumentType { .. }
         ));
+    }
+
+    #[test]
+    fn test_parse_html_keeps_the_first_of_duplicate_html_and_body_attributes() {
+        let doc = parse(r#"<html lang="en" lang="fr"><body class=a class=b>x"#);
+        let attributes = |name: &str| {
+            let element = doc
+                .descendants(doc.root())
+                .find(|&n| doc.node_name(n) == Some(name))
+                .unwrap();
+            doc.attributes(element)
+                .iter()
+                .map(|a| format!("{}={}", a.name, a.value))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(attributes("html"), ["lang=en"]);
+        assert_eq!(attributes("body"), ["class=a"]);
+    }
+
+    #[test]
+    fn test_parse_html_drops_a_start_tag_cut_off_by_the_end_of_input() {
+        // As libxml2 2.14 does: the tag is unfinished, so there is no element.
+        for (input, tag) in [
+            ("<p>a<b", "b"),
+            ("<p>a<a title=\"x>y", "a"),
+            ("<p>a<div att=", "div"),
+            ("<p>a</p><img src=\"a", "img"),
+        ] {
+            let doc = parse(input);
+            let names: Vec<_> = doc
+                .descendants(doc.root())
+                .filter_map(|n| doc.node_name(n))
+                .collect();
+            assert!(!names.contains(&tag), "{input}: {names:?}");
+            let p = doc
+                .descendants(doc.root())
+                .find(|&n| doc.node_name(n) == Some("p"))
+                .unwrap();
+            assert_eq!(doc.text_content(p), "a", "{input}");
+        }
     }
 
     #[test]

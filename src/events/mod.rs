@@ -171,6 +171,7 @@ pub(crate) fn report_diagnostics(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     /// The events for `input`, one line each, and whether the parse failed.
     fn events(input: &str, options: &ParseOptions) -> (Vec<String>, bool) {
@@ -239,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn events_come_in_document_order() {
+    fn test_parse_str_reports_events_in_document_order() {
         let (lines, failed) = events(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!--before--><r a="1" xmlns:x="u" x:b="2"><x:e/>t&amp;u<![CDATA[c]]><!--m--><?p d?></r>"#,
@@ -266,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn an_entity_reference_follows_its_replacement_text() {
+    fn test_parse_str_reports_an_entity_reference_after_its_text() {
         let (lines, _) = events(
             r#"<!DOCTYPE r [<!ENTITY t "q"><!ENTITY m "x<b>y</b>">]><r>&t;&m;.</r>"#,
             &ParseOptions::default(),
@@ -291,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn a_diagnostic_comes_where_it_occurs() {
+    fn test_parse_str_reports_a_diagnostic_where_it_occurs() {
         let (lines, failed) = events("<r><a>&u;</a></r>", &ParseOptions::default().recover(true));
         assert!(!failed);
         assert_eq!(
@@ -310,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn a_start_tag_is_located_at_its_end() {
+    fn test_parse_str_locates_a_start_tag_at_its_end() {
         let mut starts = Vec::new();
         let input = "<hello>\n\nworld\n<inter>\n    <net>\n    </net>\n</inter>\n</hello>";
         parse_str(
@@ -334,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn html_elements_are_reported_as_they_open_and_close() {
+    fn test_parse_html_reports_elements_as_they_open_and_close() {
         let lines = html_events(concat!(
             r#"<html lang="en"><head><title>T</title></head><body class="b">"#,
             "<p>a<p>b<br>c</b><script>x<y</script><!--m--></body></html>",
@@ -373,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn implied_html_elements_are_reported_and_closed_at_the_end() {
+    fn test_parse_html_reports_implied_elements_and_closes_them_at_the_end() {
         let lines = html_events("  <p>x</p>  <head><title>a</title>");
         let lines: Vec<_> = lines.iter().filter(|l| !l.starts_with("warning")).collect();
         assert_eq!(
@@ -397,7 +398,41 @@ mod tests {
     }
 
     #[test]
-    fn a_fatal_error_ends_the_events() {
+    fn test_parse_str_locates_entity_text_at_the_reference() {
+        let mut starts = Vec::new();
+        let input = "<!DOCTYPE r [<!ENTITY m \"x<b>y</b>\">]>\n\n\n<r>&m;</r>";
+        parse_str(
+            input,
+            &ParseOptions::default(),
+            &mut |event: Event<'_>, at: SourceLocation| {
+                if let Event::StartElement { name, .. } = event {
+                    starts.push((name.to_owned(), at.line, at.column));
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(starts, [("r".to_owned(), 4, 3), ("b".to_owned(), 4, 7)]);
+    }
+
+    #[test]
+    fn test_parse_html_reports_each_implied_close_after_its_warning() {
+        let lines = html_events("<div><b><i>x</div>");
+        let from = lines.iter().position(|l| l == r#"text "x""#).unwrap();
+        assert_eq!(
+            lines[from..from + 6],
+            [
+                r#"text "x""#,
+                "warning implicitly closing <i> before </div>",
+                "end i",
+                "warning implicitly closing <b> before </div>",
+                "end b",
+                "end div",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_str_ends_with_a_fatal_error() {
         let (lines, failed) = events("<r><a></r>", &ParseOptions::default());
         assert!(failed);
         assert_eq!(
