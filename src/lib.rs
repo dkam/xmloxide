@@ -40,6 +40,7 @@ pub mod catalog;
 pub mod css;
 pub mod encoding;
 pub mod error;
+pub mod events;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 pub mod html;

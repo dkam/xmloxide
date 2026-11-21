@@ -1,0 +1,414 @@
+//! Parse events: what a parser reports as it reads an XML document, in
+//! document order.
+//!
+//! This is the interface for streaming consumers such as SAX callbacks. For
+//! now the events come from the tree parser ([`parse_str`]): it builds the
+//! document as usual, reporting each node as it creates it and each warning
+//! or error as it occurs.
+//!
+//! # Examples
+//!
+//! ```
+//! use xmloxide::events::{parse_str, Event};
+//! use xmloxide::parser::ParseOptions;
+//!
+//! let mut names = Vec::new();
+//! parse_str("<r><a/><b/></r>", &ParseOptions::default(), &mut |event: Event<'_>, _at| {
+//!     if let Event::StartElement { name, .. } = event {
+//!         names.push(name.to_owned());
+//!     }
+//! })
+//! .unwrap();
+//! assert_eq!(names, ["r", "a", "b"]);
+//! ```
+
+use crate::error::{ErrorSeverity, ParseDiagnostic, ParseError, SourceLocation};
+use crate::html::HtmlParseOptions;
+use crate::parser::ParseOptions;
+use crate::tree::Attribute;
+
+/// One thing the parser found, borrowed from the parser for the duration of
+/// the call.
+#[derive(Debug, Clone, Copy)]
+pub enum Event<'a> {
+    /// The XML declaration. Reported first, before `StartDocument`.
+    XmlDeclaration {
+        version: &'a str,
+        encoding: Option<&'a str>,
+        standalone: Option<bool>,
+    },
+    /// The start of the document, after the XML declaration if there is one.
+    StartDocument,
+    /// A start tag or an empty-element tag. The attributes are as the tree
+    /// stores them, in document order, namespace declarations (`xmlns` and
+    /// `xmlns:p`) included.
+    StartElement {
+        name: &'a str,
+        prefix: Option<&'a str>,
+        namespace: Option<&'a str>,
+        attributes: &'a [Attribute],
+    },
+    /// An end tag, or the end of an empty-element tag.
+    EndElement {
+        name: &'a str,
+        prefix: Option<&'a str>,
+        namespace: Option<&'a str>,
+    },
+    /// Character data, with references to character and predefined
+    /// entities replaced.
+    Text(&'a str),
+    /// The content of a CDATA section.
+    CData(&'a str),
+    /// The content of a comment.
+    Comment(&'a str),
+    /// A processing instruction.
+    ProcessingInstruction {
+        target: &'a str,
+        data: Option<&'a str>,
+    },
+    /// A reference to a general entity other than the predefined ones,
+    /// reported after the events for its replacement text. The replacement
+    /// text is `None` if it isn't known: the entity is undeclared, or
+    /// external and not loaded.
+    EntityReference {
+        name: &'a str,
+        replacement: Option<&'a str>,
+    },
+    /// A warning or error, where it occurs. A fatal error is the last event
+    /// before `EndDocument`.
+    Diagnostic(&'a ParseDiagnostic),
+    /// The end of the document: always the last event, after a fatal error
+    /// too.
+    EndDocument,
+}
+
+/// Receives parse events.
+pub trait EventHandler {
+    /// Called for each event, in document order, with where the parser is
+    /// in the input: for a start tag, at its closing `>` (or `/>`).
+    fn event(&mut self, event: Event<'_>, location: SourceLocation);
+}
+
+impl<F: FnMut(Event<'_>, SourceLocation)> EventHandler for F {
+    fn event(&mut self, event: Event<'_>, location: SourceLocation) {
+        self(event, location);
+    }
+}
+
+/// Parses `input`, reporting what it finds to `handler`.
+///
+/// # Errors
+///
+/// Returns the fatal error that stopped the parse, which `handler` has
+/// already seen as a [`Event::Diagnostic`].
+pub fn parse_str(
+    input: &str,
+    options: &ParseOptions,
+    handler: &mut dyn EventHandler,
+) -> Result<(), ParseError> {
+    crate::parser::parse_str_reporting(input, options, handler).map(drop)
+}
+
+/// Parses `input` as HTML, reporting what it finds to `handler`. Elements
+/// are reported as they are opened and closed, implied ones included, and
+/// raw text (the content of `script` and the like) as text.
+///
+/// # Errors
+///
+/// Returns the fatal error that stopped the parse, which `handler` has
+/// already seen as a [`Event::Diagnostic`].
+pub fn parse_html(
+    input: &str,
+    options: &HtmlParseOptions,
+    handler: &mut dyn EventHandler,
+) -> Result<(), ParseError> {
+    crate::html::parse_html_reporting(input, options, handler).map(drop)
+}
+
+/// Reports `diagnostics` from `*reported` on, then `event` at `location`.
+pub(crate) fn report(
+    handler: &mut dyn EventHandler,
+    diagnostics: &[ParseDiagnostic],
+    reported: &mut usize,
+    event: Event<'_>,
+    location: SourceLocation,
+) {
+    report_diagnostics(handler, diagnostics, reported);
+    handler.event(event, location);
+}
+
+/// Reports how a parse ended: the fatal error that stopped it, if one did,
+/// then the end of the document, at `location`.
+pub(crate) fn report_end(
+    handler: &mut dyn EventHandler,
+    error: Option<&ParseError>,
+    location: SourceLocation,
+) {
+    if let Some(error) = error {
+        let fatal = ParseDiagnostic {
+            severity: ErrorSeverity::Fatal,
+            message: error.message.clone(),
+            location: error.location,
+        };
+        handler.event(Event::Diagnostic(&fatal), error.location);
+    }
+    handler.event(Event::EndDocument, location);
+}
+
+/// Reports `diagnostics` from `*reported` on.
+pub(crate) fn report_diagnostics(
+    handler: &mut dyn EventHandler,
+    diagnostics: &[ParseDiagnostic],
+    reported: &mut usize,
+) {
+    for diagnostic in &diagnostics[*reported..] {
+        handler.event(Event::Diagnostic(diagnostic), diagnostic.location);
+    }
+    *reported = diagnostics.len();
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// The events for `input`, one line each, and whether the parse failed.
+    fn events(input: &str, options: &ParseOptions) -> (Vec<String>, bool) {
+        lines_of(|handler| parse_str(input, options, handler))
+    }
+
+    /// The events for HTML `input`, one line each.
+    fn html_events(input: &str) -> Vec<String> {
+        lines_of(|handler| parse_html(input, &HtmlParseOptions::default(), handler)).0
+    }
+
+    /// The events `parse` reports, one line each, and whether it failed.
+    fn lines_of(
+        parse: impl FnOnce(&mut dyn EventHandler) -> Result<(), ParseError>,
+    ) -> (Vec<String>, bool) {
+        let mut lines = Vec::new();
+        let result = parse(&mut |event: Event<'_>, _at| {
+            let name = |prefix: Option<&str>, name: &str, namespace: Option<&str>| {
+                let qname = prefix.map_or(name.to_owned(), |p| format!("{p}:{name}"));
+                namespace.map_or(qname.clone(), |ns| format!("{qname}{{{ns}}}"))
+            };
+            lines.push(match event {
+                Event::XmlDeclaration {
+                    version,
+                    encoding,
+                    standalone,
+                } => format!("decl {version} {encoding:?} {standalone:?}"),
+                Event::StartDocument => "start-document".to_owned(),
+                Event::StartElement {
+                    name: local,
+                    prefix,
+                    namespace,
+                    attributes,
+                } => {
+                    let attributes = attributes.iter().map(|a| {
+                        let qname = name(a.prefix.as_deref(), &a.name, a.namespace.as_deref());
+                        format!(" {qname}={}", a.value)
+                    });
+                    format!("start {}", name(prefix, local, namespace))
+                        + &attributes.collect::<String>()
+                }
+                Event::EndElement {
+                    name: local,
+                    prefix,
+                    namespace,
+                } => format!("end {}", name(prefix, local, namespace)),
+                Event::Text(text) => format!("text {text:?}"),
+                Event::CData(text) => format!("cdata {text:?}"),
+                Event::Comment(text) => format!("comment {text:?}"),
+                Event::ProcessingInstruction { target, data } => format!("pi {target} {data:?}"),
+                Event::EntityReference { name, replacement } => {
+                    format!("reference {name} {replacement:?}")
+                }
+                Event::Diagnostic(d) => {
+                    let level = match d.severity {
+                        ErrorSeverity::Warning => "warning",
+                        ErrorSeverity::Error => "error",
+                        ErrorSeverity::Fatal => "fatal",
+                    };
+                    format!("{level} {}", d.message)
+                }
+                Event::EndDocument => "end-document".to_owned(),
+            });
+        });
+        (lines, result.is_err())
+    }
+
+    #[test]
+    fn events_come_in_document_order() {
+        let (lines, failed) = events(
+            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--before--><r a="1" xmlns:x="u" x:b="2"><x:e/>t&amp;u<![CDATA[c]]><!--m--><?p d?></r>"#,
+            &ParseOptions::default(),
+        );
+        assert!(!failed);
+        assert_eq!(
+            lines,
+            [
+                r#"decl 1.0 Some("UTF-8") Some(true)"#,
+                "start-document",
+                r#"comment "before""#,
+                "start r a=1 xmlns:x=u x:b{u}=2",
+                "start x:e{u}",
+                "end x:e{u}",
+                r#"text "t&u""#,
+                r#"cdata "c""#,
+                r#"comment "m""#,
+                r#"pi p Some("d")"#,
+                "end r",
+                "end-document",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_entity_reference_follows_its_replacement_text() {
+        let (lines, _) = events(
+            r#"<!DOCTYPE r [<!ENTITY t "q"><!ENTITY m "x<b>y</b>">]><r>&t;&m;.</r>"#,
+            &ParseOptions::default(),
+        );
+        assert_eq!(
+            lines,
+            [
+                "start-document",
+                "start r",
+                r#"text "q""#,
+                r#"reference t Some("q")"#,
+                r#"text "x""#,
+                "start b",
+                r#"text "y""#,
+                "end b",
+                r#"reference m Some("x<b>y</b>")"#,
+                r#"text ".""#,
+                "end r",
+                "end-document",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_diagnostic_comes_where_it_occurs() {
+        let (lines, failed) = events("<r><a>&u;</a></r>", &ParseOptions::default().recover(true));
+        assert!(!failed);
+        assert_eq!(
+            lines,
+            [
+                "start-document",
+                "start r",
+                "start a",
+                "warning unknown entity reference: &u;",
+                "reference u None",
+                "end a",
+                "end r",
+                "end-document",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_start_tag_is_located_at_its_end() {
+        let mut starts = Vec::new();
+        let input = "<hello>\n\nworld\n<inter>\n    <net>\n    </net>\n</inter>\n</hello>";
+        parse_str(
+            input,
+            &ParseOptions::default(),
+            &mut |event: Event<'_>, at: SourceLocation| {
+                if let Event::StartElement { name, .. } = event {
+                    starts.push((name.to_owned(), at.line, at.column));
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            starts,
+            [
+                ("hello".to_owned(), 1, 7),
+                ("inter".to_owned(), 4, 7),
+                ("net".to_owned(), 5, 9)
+            ]
+        );
+    }
+
+    #[test]
+    fn html_elements_are_reported_as_they_open_and_close() {
+        let lines = html_events(concat!(
+            r#"<html lang="en"><head><title>T</title></head><body class="b">"#,
+            "<p>a<p>b<br>c</b><script>x<y</script><!--m--></body></html>",
+        ));
+        assert_eq!(
+            lines,
+            [
+                "start-document",
+                "start html lang=en",
+                "start head",
+                "start title",
+                r#"text "T""#,
+                "end title",
+                "end head",
+                "start body class=b",
+                "start p",
+                r#"text "a""#,
+                "end p",
+                "start p",
+                r#"text "b""#,
+                "start br",
+                "end br",
+                r#"text "c""#,
+                "warning stray end tag </b>",
+                "start script",
+                r#"text "x<y""#,
+                "end script",
+                r#"comment "m""#,
+                "warning implicitly closing <p> before </body>",
+                "end p",
+                "end body",
+                "end html",
+                "end-document",
+            ]
+        );
+    }
+
+    #[test]
+    fn implied_html_elements_are_reported_and_closed_at_the_end() {
+        let lines = html_events("  <p>x</p>  <head><title>a</title>");
+        let lines: Vec<_> = lines.iter().filter(|l| !l.starts_with("warning")).collect();
+        assert_eq!(
+            lines,
+            [
+                "start-document",
+                "start html",
+                "start body",
+                "start p",
+                r#"text "x""#,
+                "end p",
+                r#"text "  ""#,
+                "start title",
+                r#"text "a""#,
+                "end title",
+                "end body",
+                "end html",
+                "end-document",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fatal_error_ends_the_events() {
+        let (lines, failed) = events("<r><a></r>", &ParseOptions::default());
+        assert!(failed);
+        assert_eq!(
+            lines,
+            [
+                "start-document",
+                "start r",
+                "start a",
+                "fatal mismatched end tag: expected </a>, found </r>",
+                "end-document",
+            ]
+        );
+    }
+}

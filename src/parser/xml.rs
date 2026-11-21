@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 
-use crate::error::{ErrorSeverity, ParseError};
+use crate::error::{ErrorSeverity, ParseError, SourceLocation};
+use crate::events::{report, report_diagnostics, Event, EventHandler};
 use crate::tree::{Attribute, Document, NodeId, NodeKind};
 use crate::validation::dtd::{parse_dtd, serialize_dtd, AttributeDecl, AttributeType, EntityKind};
 
@@ -33,7 +34,7 @@ const DEFAULT_MAX_AMPLIFICATION: usize = 5;
 const MAX_ENTITY_DEPTH: u32 = 32;
 
 /// The core XML parser.
-pub(crate) struct XmlParser<'a> {
+pub(crate) struct XmlParser<'a, 'h> {
     /// Shared low-level input state (position, peek, advance, name parsing, etc.).
     input: ParserInput<'a>,
     /// The document being built.
@@ -54,9 +55,13 @@ pub(crate) struct XmlParser<'a> {
     expansion_size: usize,
     /// Current nesting depth of general entity expansion (0 = document level).
     entity_depth: u32,
+    /// Where to report parse events, if anywhere.
+    pub(crate) events: Option<&'h mut dyn EventHandler>,
+    /// How many of the input's diagnostics have been reported as events.
+    reported: usize,
 }
 
-impl<'a> XmlParser<'a> {
+impl<'a> XmlParser<'a, '_> {
     pub fn new(input: &'a str, options: &ParseOptions) -> Self {
         let mut pi = ParserInput::new(input);
         pi.set_recover(options.recover);
@@ -77,6 +82,83 @@ impl<'a> XmlParser<'a> {
             input_size: input.len(),
             expansion_size: 0,
             entity_depth: 0,
+            events: None,
+            reported: 0,
+        }
+    }
+
+    /// Where the parser is in the input.
+    pub(crate) fn location(&self) -> SourceLocation {
+        self.input.location()
+    }
+
+    /// Reports `event`, after any diagnostics not yet reported.
+    fn emit(&mut self, event: Event<'_>) {
+        if let Some(handler) = self.events.as_deref_mut() {
+            let location = self.input.location();
+            report(
+                handler,
+                &self.input.diagnostics,
+                &mut self.reported,
+                event,
+                location,
+            );
+        }
+    }
+
+    /// Reports the diagnostics not yet reported.
+    pub(crate) fn report_diagnostics(&mut self) {
+        if let Some(handler) = self.events.as_deref_mut() {
+            report_diagnostics(handler, &self.input.diagnostics, &mut self.reported);
+        }
+    }
+
+    /// Reports the end of `element`.
+    fn emit_end_element(&mut self, element: NodeId) {
+        let Some(handler) = self.events.as_deref_mut() else {
+            return;
+        };
+        if let NodeKind::Element {
+            name,
+            prefix,
+            namespace,
+            ..
+        } = &self.doc.node(element).kind
+        {
+            let event = Event::EndElement {
+                name,
+                prefix: prefix.as_deref(),
+                namespace: namespace.as_deref(),
+            };
+            let location = self.input.location();
+            report(
+                handler,
+                &self.input.diagnostics,
+                &mut self.reported,
+                event,
+                location,
+            );
+        }
+    }
+
+    /// Reports the entity reference `reference`.
+    fn emit_entity_reference(&mut self, reference: NodeId) {
+        let Some(handler) = self.events.as_deref_mut() else {
+            return;
+        };
+        if let NodeKind::EntityRef { name, value } = &self.doc.node(reference).kind {
+            let event = Event::EntityReference {
+                name,
+                replacement: value.as_deref(),
+            };
+            let location = self.input.location();
+            report(
+                handler,
+                &self.input.diagnostics,
+                &mut self.reported,
+                event,
+                location,
+            );
         }
     }
 
@@ -108,6 +190,7 @@ impl<'a> XmlParser<'a> {
                     .fatal("XML declaration must be at the start of the document"));
             }
         }
+        self.emit(Event::StartDocument);
 
         // Parse prolog content (comments, PIs, whitespace before root element)
         self.parse_misc(self.doc.root())?;
@@ -142,6 +225,7 @@ impl<'a> XmlParser<'a> {
         }
 
         // Sync diagnostics from input to document before returning.
+        self.report_diagnostics();
         self.doc.diagnostics = std::mem::take(&mut self.input.diagnostics);
 
         Ok(std::mem::take(&mut self.doc))
@@ -152,6 +236,11 @@ impl<'a> XmlParser<'a> {
 
     fn parse_xml_declaration(&mut self) -> Result<(), ParseError> {
         let decl = parse_xml_decl(&mut self.input)?;
+        self.emit(Event::XmlDeclaration {
+            version: &decl.version,
+            encoding: decl.encoding.as_deref(),
+            standalone: decl.standalone,
+        });
         self.doc.version = Some(decl.version);
         self.doc.encoding = decl.encoding;
         self.doc.standalone = decl.standalone;
@@ -828,6 +917,12 @@ impl<'a> XmlParser<'a> {
         // Consume the original name String via split_owned_name, avoiding a
         // re-allocation for unprefixed names (the common case). For unprefixed
         // names, split_owned_name returns (None, name) — just a move, zero copy.
+        self.emit(Event::StartElement {
+            name: local_name,
+            prefix,
+            namespace: elem_ns.as_deref(),
+            attributes: &attributes,
+        });
         let (elem_prefix_owned, elem_local_owned) = split_owned_name(name);
         let elem_id = self.doc.create_node(NodeKind::Element {
             name: elem_local_owned,
@@ -840,6 +935,7 @@ impl<'a> XmlParser<'a> {
         // Empty element tag <foo/>
         if self.input.looking_at(b"/>") {
             self.input.advance(2);
+            self.emit_end_element(elem_id);
             if has_ns_decls {
                 self.ns.pop_scope();
             }
@@ -881,6 +977,7 @@ impl<'a> XmlParser<'a> {
         }
         self.input.skip_whitespace();
         self.input.expect_byte(b'>')?;
+        self.emit_end_element(elem_id);
 
         // Pop the namespace scope when leaving this element (only if we pushed).
         if has_ns_decls {
@@ -1062,9 +1159,9 @@ impl<'a> XmlParser<'a> {
                 {
                     // Flush accumulated text before the entity ref
                     if !text.is_empty() {
-                        let text_id = self.doc.create_node(NodeKind::Text {
-                            content: std::mem::take(&mut text),
-                        });
+                        let content = std::mem::take(&mut text);
+                        self.emit(Event::Text(&content));
+                        let text_id = self.doc.create_node(NodeKind::Text { content });
                         self.doc.append_child(parent, text_id);
                     }
                     self.parse_entity_ref_in_content(parent)?;
@@ -1082,6 +1179,7 @@ impl<'a> XmlParser<'a> {
             if self.options.no_blanks && text.chars().all(char::is_whitespace) {
                 return Ok(());
             }
+            self.emit(Event::Text(&text));
             let text_id = self.doc.create_node(NodeKind::Text { content: text });
             self.doc.append_child(parent, text_id);
         }
@@ -1152,33 +1250,30 @@ impl<'a> XmlParser<'a> {
         });
         self.doc.append_child(parent, ref_id);
 
-        let Some(replacement) = replacement else {
-            return Ok(());
-        };
-        if replacement.is_empty() {
-            return Ok(());
-        }
+        if let Some(replacement) = replacement.filter(|r| !r.is_empty()) {
+            // Amplification guard (matches libxml2's max amplification factor).
+            self.expansion_size += replacement.len();
+            if self.expansion_size > self.input_size.saturating_mul(DEFAULT_MAX_AMPLIFICATION) {
+                return Err(self
+                    .input
+                    .fatal("maximum entity amplification factor exceeded"));
+            }
 
-        // Amplification guard (matches libxml2's max amplification factor).
-        self.expansion_size += replacement.len();
-        if self.expansion_size > self.input_size.saturating_mul(DEFAULT_MAX_AMPLIFICATION) {
-            return Err(self
-                .input
-                .fatal("maximum entity amplification factor exceeded"));
-        }
-
-        if !replacement.contains('<') && !replacement.contains('&') {
-            // Fast path: plain character data — no markup, no references.
-            let content = if replacement.contains('\r') {
-                normalize_line_ends(&replacement)
+            if !replacement.contains('<') && !replacement.contains('&') {
+                // Fast path: plain character data — no markup, no references.
+                let content = if replacement.contains('\r') {
+                    normalize_line_ends(&replacement)
+                } else {
+                    replacement
+                };
+                self.emit(Event::Text(&content));
+                let text_id = self.doc.create_node(NodeKind::Text { content });
+                self.doc.append_child(ref_id, text_id);
             } else {
-                replacement
-            };
-            let text_id = self.doc.create_node(NodeKind::Text { content });
-            self.doc.append_child(ref_id, text_id);
-        } else {
-            self.parse_replacement_as_content(&name, &replacement, ref_id)?;
+                self.parse_replacement_as_content(&name, &replacement, ref_id)?;
+            }
         }
+        self.emit_entity_reference(ref_id);
         Ok(())
     }
 
@@ -1219,9 +1314,14 @@ impl<'a> XmlParser<'a> {
         sub.attr_types = std::mem::take(&mut self.attr_types);
         sub.attr_defaults = std::mem::take(&mut self.attr_defaults);
         std::mem::swap(&mut sub.ns, &mut self.ns);
+        // The sub-parser reports the replacement text's events.
+        self.report_diagnostics();
+        sub.events = self.events.take();
 
         let sub_root = sub.doc.root();
         let result = sub.parse_content_fragment(sub_root);
+        sub.report_diagnostics();
+        self.events = sub.events.take();
 
         // Restore shared state regardless of outcome.
         self.input.entity_map = std::mem::take(&mut sub.input.entity_map);
@@ -1234,6 +1334,7 @@ impl<'a> XmlParser<'a> {
         if !sub.input.diagnostics.is_empty() {
             self.input.diagnostics.append(&mut sub.input.diagnostics);
         }
+        self.reported = self.input.diagnostics.len();
 
         if let Err(e) = result {
             // Propagate security-limit errors and already-wrapped entity
@@ -1430,6 +1531,7 @@ impl<'a> XmlParser<'a> {
 
     fn parse_comment(&mut self, parent: NodeId) -> Result<(), ParseError> {
         let content = parse_comment_content(&mut self.input)?;
+        self.emit(Event::Comment(&content));
         let comment_id = self.doc.create_node(NodeKind::Comment { content });
         self.doc.append_child(parent, comment_id);
         Ok(())
@@ -1440,6 +1542,7 @@ impl<'a> XmlParser<'a> {
 
     fn parse_cdata(&mut self, parent: NodeId) -> Result<(), ParseError> {
         let content = parse_cdata_content(&mut self.input)?;
+        self.emit(Event::CData(&content));
         let cdata_id = self.doc.create_node(NodeKind::CData { content });
         self.doc.append_child(parent, cdata_id);
         Ok(())
@@ -1450,6 +1553,10 @@ impl<'a> XmlParser<'a> {
 
     fn parse_processing_instruction(&mut self, parent: NodeId) -> Result<(), ParseError> {
         let (target, data) = parse_pi_content(&mut self.input)?;
+        self.emit(Event::ProcessingInstruction {
+            target: &target,
+            data: data.as_deref(),
+        });
         let pi_id = self
             .doc
             .create_node(NodeKind::ProcessingInstruction { target, data });

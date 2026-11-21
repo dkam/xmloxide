@@ -27,6 +27,7 @@
 pub mod entities;
 
 use crate::error::{ErrorSeverity, ParseDiagnostic, ParseError};
+use crate::events::{report, report_diagnostics, report_end, Event, EventHandler};
 use crate::parser::input::ParserInput;
 use crate::tree::{Attribute, Document, NodeId, NodeKind};
 
@@ -184,6 +185,26 @@ pub fn parse_html_with_options(
     parser.parse()
 }
 
+/// Parses an HTML string, reporting each event to `handler` as it occurs
+/// (see [`crate::events::parse_html`]).
+pub(crate) fn parse_html_reporting(
+    input: &str,
+    options: &HtmlParseOptions,
+    handler: &mut dyn EventHandler,
+) -> Result<Document, ParseError> {
+    let mut parser = HtmlParser::new(input, options);
+    parser.events = Some(handler);
+    let result = parser.parse();
+    if result.is_err() {
+        parser.report_diagnostics();
+    }
+    let location = parser.input.location();
+    if let Some(handler) = parser.events {
+        report_end(handler, result.as_ref().err(), location);
+    }
+    result
+}
+
 // --- Void elements (elements that must not have content) ---
 // See HTML 4.01 and common usage. These elements are self-closing.
 
@@ -297,7 +318,7 @@ fn is_head_content_element(tag: &str) -> bool {
 /// - Accepts unquoted and boolean attributes
 /// - Resolves HTML named character references
 /// - Adds implied elements (html, head, body) when missing
-struct HtmlParser<'a> {
+struct HtmlParser<'a, 'h> {
     /// Shared low-level input state (position, peek, advance, etc.).
     input: ParserInput<'a>,
     /// The document being built.
@@ -311,9 +332,13 @@ struct HtmlParser<'a> {
     /// How many misplaced `<head>` start tags were dropped, whose end tags
     /// are dropped too (libxml2's `ctxt->depth`).
     dropped_heads: usize,
+    /// Where to report parse events, if anywhere.
+    events: Option<&'h mut dyn EventHandler>,
+    /// How many of the document's diagnostics have been reported as events.
+    reported: usize,
 }
 
-impl<'a> HtmlParser<'a> {
+impl<'a> HtmlParser<'a, '_> {
     fn new(input: &'a str, options: &HtmlParseOptions) -> Self {
         let mut pi = ParserInput::new(input);
         pi.set_recover(options.recover);
@@ -325,7 +350,80 @@ impl<'a> HtmlParser<'a> {
             open_elements: Vec::new(),
             fatal_error: None,
             dropped_heads: 0,
+            events: None,
+            reported: 0,
         }
+    }
+
+    /// Reports `event`, after any diagnostics not yet reported.
+    fn emit(&mut self, event: Event<'_>) {
+        if let Some(handler) = self.events.as_deref_mut() {
+            let location = self.input.location();
+            report(
+                handler,
+                &self.doc.diagnostics,
+                &mut self.reported,
+                event,
+                location,
+            );
+        }
+    }
+
+    /// Reports the diagnostics not yet reported.
+    fn report_diagnostics(&mut self) {
+        if let Some(handler) = self.events.as_deref_mut() {
+            report_diagnostics(handler, &self.doc.diagnostics, &mut self.reported);
+        }
+    }
+
+    /// Opens `element`, which `tag` names: it is where content goes until
+    /// it is closed.
+    fn open_element(&mut self, element: NodeId, tag: String) {
+        if let Some(handler) = self.events.as_deref_mut() {
+            if let NodeKind::Element { attributes, .. } = &self.doc.node(element).kind {
+                let event = Event::StartElement {
+                    name: &tag,
+                    prefix: None,
+                    namespace: None,
+                    attributes,
+                };
+                let location = self.input.location();
+                report(
+                    handler,
+                    &self.doc.diagnostics,
+                    &mut self.reported,
+                    event,
+                    location,
+                );
+            }
+        }
+        self.open_elements.push((element, tag));
+    }
+
+    /// Closes the open elements after the first `len`, innermost first.
+    fn close_elements(&mut self, len: usize) {
+        while self.open_elements.len() > len {
+            if let Some((_, tag)) = self.open_elements.pop() {
+                self.emit(Event::EndElement {
+                    name: &tag,
+                    prefix: None,
+                    namespace: None,
+                });
+            }
+        }
+    }
+
+    /// Closes the innermost open element.
+    fn close_element(&mut self) {
+        self.close_elements(self.open_elements.len().saturating_sub(1));
+    }
+
+    /// Appends a comment to the current element.
+    fn append_comment(&mut self, content: String) {
+        self.emit(Event::Comment(&content));
+        let parent = self.current_parent();
+        let comment_id = self.doc.create_node(NodeKind::Comment { content });
+        self.doc.append_child(parent, comment_id);
     }
 
     /// Returns the input from `start` to `end` as an owned string.
@@ -342,6 +440,7 @@ impl<'a> HtmlParser<'a> {
 
     /// Main parse entry point. Parses the entire HTML document.
     fn parse(&mut self) -> Result<Document, ParseError> {
+        self.emit(Event::StartDocument);
         self.input.skip_whitespace();
 
         // Track whether a DOCTYPE was found in the input
@@ -363,9 +462,12 @@ impl<'a> HtmlParser<'a> {
         }
 
         // Close any remaining open elements
-        while let Some((_, tag)) = self.open_elements.pop() {
-            self.push_warning(format!("unclosed element <{tag}> at end of document"));
+        while let Some((_, tag)) = self.open_elements.last() {
+            let message = format!("unclosed element <{tag}> at end of document");
+            self.push_warning(message);
+            self.close_element();
         }
+        self.report_diagnostics();
 
         // Add default DOCTYPE if none was in the input and not disabled
         if !has_doctype && !self.options.no_default_doctype {
@@ -383,13 +485,15 @@ impl<'a> HtmlParser<'a> {
         Ok(std::mem::take(&mut self.doc))
     }
 
-    /// Ensures an implied `<html>` element exists at the document root.
-    /// Returns its `NodeId`.
-    fn ensure_html(&mut self) -> NodeId {
+    /// Ensures an `<html>` element exists at the document root, with
+    /// `attributes` (from a start tag) merged into one that does, and
+    /// opening one it creates. Returns its `NodeId`.
+    fn ensure_html(&mut self, attributes: Vec<Attribute>) -> NodeId {
         let root = self.doc.root();
         // Look for existing html element
         for id in self.doc.children(root) {
             if matches!(&self.doc.node(id).kind, NodeKind::Element { name, .. } if name == "html") {
+                self.merge_attributes(id, attributes);
                 return id;
             }
         }
@@ -398,20 +502,21 @@ impl<'a> HtmlParser<'a> {
             name: "html".to_string(),
             prefix: None,
             namespace: None,
-            attributes: vec![],
+            attributes,
         });
         self.doc.append_child(root, html_id);
-        self.open_elements.push((html_id, "html".to_string()));
+        self.open_element(html_id, "html".to_string());
         html_id
     }
 
-    /// Ensures an implied `<body>` element exists under `<html>`.
-    /// Returns its `NodeId`.
-    fn ensure_body(&mut self) -> NodeId {
-        let html_id = self.ensure_html();
+    /// Ensures a `<body>` element exists under `<html>`, as `ensure_html`
+    /// does an `<html>`. Returns its `NodeId`.
+    fn ensure_body(&mut self, attributes: Vec<Attribute>) -> NodeId {
+        let html_id = self.ensure_html(Vec::new());
         // Look for existing body element
         for id in self.doc.children(html_id) {
             if matches!(&self.doc.node(id).kind, NodeKind::Element { name, .. } if name == "body") {
+                self.merge_attributes(id, attributes);
                 return id;
             }
         }
@@ -420,17 +525,17 @@ impl<'a> HtmlParser<'a> {
             name: "body".to_string(),
             prefix: None,
             namespace: None,
-            attributes: vec![],
+            attributes,
         });
         self.doc.append_child(html_id, body_id);
-        self.open_elements.push((body_id, "body".to_string()));
+        self.open_element(body_id, "body".to_string());
         body_id
     }
 
     /// Ensures an implied `<head>` element exists under `<html>`.
     /// Returns its `NodeId`.
     fn ensure_head(&mut self) -> NodeId {
-        let html_id = self.ensure_html();
+        let html_id = self.ensure_html(Vec::new());
         // Look for existing head element
         for id in self.doc.children(html_id) {
             if matches!(&self.doc.node(id).kind, NodeKind::Element { name, .. } if name == "head") {
@@ -502,7 +607,7 @@ impl<'a> HtmlParser<'a> {
                 // parse_text() breaks on '<' without advancing.
                 self.input.advance(1);
                 if !self.options.no_implied && self.open_elements.is_empty() {
-                    self.ensure_body();
+                    self.ensure_body(Vec::new());
                 }
                 let parent = self.current_parent();
                 self.append_text(parent, "<".to_string());
@@ -600,11 +705,10 @@ impl<'a> HtmlParser<'a> {
         // Handle structural elements by merging with existing implied elements
         if !self.options.no_implied {
             if lower_tag == "html" {
-                let html_id = self.ensure_html();
-                self.merge_attributes(html_id, attributes);
+                let html_id = self.ensure_html(attributes);
                 // Ensure html is on the open_elements stack
                 if !self.open_elements.iter().any(|(_, t)| t == "html") {
-                    self.open_elements.push((html_id, "html".to_string()));
+                    self.open_element(html_id, "html".to_string());
                 }
                 self.input.decrement_depth();
                 return;
@@ -621,7 +725,7 @@ impl<'a> HtmlParser<'a> {
                     let head_id = self.ensure_head();
                     self.merge_attributes(head_id, attributes);
                     // Push head to open_elements so child elements go inside it
-                    self.open_elements.push((head_id, "head".to_string()));
+                    self.open_element(head_id, "head".to_string());
                 }
                 self.input.decrement_depth();
                 return;
@@ -629,10 +733,9 @@ impl<'a> HtmlParser<'a> {
             if lower_tag == "body" && !self.is_in_frameset() {
                 // Close head if open
                 self.close_head_if_open();
-                let body_id = self.ensure_body();
-                self.merge_attributes(body_id, attributes);
+                let body_id = self.ensure_body(attributes);
                 if !self.open_elements.iter().any(|(_, t)| t == "body") {
-                    self.open_elements.push((body_id, "body".to_string()));
+                    self.open_element(body_id, "body".to_string());
                 }
                 self.input.decrement_depth();
                 return;
@@ -649,7 +752,7 @@ impl<'a> HtmlParser<'a> {
                 // <frameset> replaces <body> in HTML 4.01 — place it
                 // directly under <html>, not inside <body>
                 self.close_head_if_open();
-                self.ensure_html();
+                self.ensure_html(Vec::new());
             } else if is_head_content_element(&lower_tag)
                 && !self.is_in_body()
                 && !self.html_has_child("body")
@@ -660,7 +763,7 @@ impl<'a> HtmlParser<'a> {
                 // <head>.
                 let head_id = self.ensure_head();
                 if !self.open_elements.iter().any(|(_, t)| t == "head") {
-                    self.open_elements.push((head_id, "head".to_string()));
+                    self.open_element(head_id, "head".to_string());
                 }
             } else if self.is_in_frameset() {
                 // Inside a frameset context, don't auto-create body.
@@ -668,7 +771,7 @@ impl<'a> HtmlParser<'a> {
             } else {
                 // Body-content elements: close head, ensure body exists
                 self.close_head_if_open();
-                self.ensure_body();
+                self.ensure_body(Vec::new());
             }
         }
 
@@ -682,23 +785,25 @@ impl<'a> HtmlParser<'a> {
         });
         self.doc.append_child(parent, elem_id);
 
-        // Void elements and explicit self-close don't get pushed
+        // Void elements and explicit self-close are closed at once
         if is_void_element(&lower_tag) || explicit_self_close {
+            self.open_element(elem_id, lower_tag);
+            self.close_element();
             self.input.decrement_depth();
             return;
         }
 
         // Raw text elements (script, style) need special handling
         if is_raw_text_element(&lower_tag) {
-            self.open_elements.push((elem_id, lower_tag.clone()));
+            self.open_element(elem_id, lower_tag.clone());
             self.parse_raw_text(&lower_tag);
             // pop the element after raw text
-            self.open_elements.pop();
+            self.close_element();
             self.input.decrement_depth();
             return;
         }
 
-        self.open_elements.push((elem_id, lower_tag));
+        self.open_element(elem_id, lower_tag);
     }
 
     /// Merges attributes from a parsed tag into an existing element node.
@@ -718,7 +823,7 @@ impl<'a> HtmlParser<'a> {
     /// Closes `<head>` if it's currently open on the element stack.
     fn close_head_if_open(&mut self) {
         if self.open_elements.last().is_some_and(|(_, t)| t == "head") {
-            self.open_elements.pop();
+            self.close_element();
         }
     }
 
@@ -742,7 +847,7 @@ impl<'a> HtmlParser<'a> {
                 .last()
                 .is_some_and(|(_, open_tag)| auto_closes(open_tag, new_tag));
             if should_close {
-                self.open_elements.pop();
+                self.close_element();
                 self.input.decrement_depth();
             } else {
                 break;
@@ -801,7 +906,7 @@ impl<'a> HtmlParser<'a> {
             for _ in 0..count {
                 self.input.decrement_depth();
             }
-            self.open_elements.truncate(idx);
+            self.close_elements(idx);
         } else {
             // No matching open element — stray end tag
             self.push_warning(format!("stray end tag </{lower_tag}>"));
@@ -980,7 +1085,7 @@ impl<'a> HtmlParser<'a> {
                 if text.chars().all(char::is_whitespace) {
                     return;
                 }
-                self.ensure_body();
+                self.ensure_body(Vec::new());
             } else if self.text_belongs_in_body(&text) {
                 // Character data cannot live in <head> (or directly in
                 // <html> before <body>): leading whitespace stays where it
@@ -998,7 +1103,7 @@ impl<'a> HtmlParser<'a> {
                     self.append_text(parent, text);
                 }
                 self.close_head_if_open();
-                self.ensure_body();
+                self.ensure_body(Vec::new());
                 text = rest;
             }
             let parent = self.current_parent();
@@ -1010,6 +1115,7 @@ impl<'a> HtmlParser<'a> {
     /// an end tag that closed nothing, say), as libxml2's SAX handler
     /// merges adjacent character data, and otherwise as a new text node.
     fn append_text(&mut self, parent: NodeId, text: String) {
+        self.emit(Event::Text(&text));
         if let Some(last) = self.doc.last_child(parent) {
             if let NodeKind::Text { content } = self.doc.kind_mut(last) {
                 content.push_str(&text);
@@ -1068,6 +1174,7 @@ impl<'a> HtmlParser<'a> {
         }
 
         if !content.is_empty() {
+            self.emit(Event::Text(&content));
             let parent = self.current_parent();
             let text_id = self.doc.create_node(NodeKind::Text { content });
             self.doc.append_child(parent, text_id);
@@ -1091,20 +1198,12 @@ impl<'a> HtmlParser<'a> {
         // Handle abrupt closing: <!-->  and <!--->
         if self.input.peek() == Some(b'>') {
             self.input.advance(1);
-            let parent = self.current_parent();
-            let comment_id = self.doc.create_node(NodeKind::Comment {
-                content: String::new(),
-            });
-            self.doc.append_child(parent, comment_id);
+            self.append_comment(String::new());
             return;
         }
         if self.input.looking_at(b"->") {
             self.input.advance(2);
-            let parent = self.current_parent();
-            let comment_id = self.doc.create_node(NodeKind::Comment {
-                content: String::new(),
-            });
-            self.doc.append_child(parent, comment_id);
+            self.append_comment(String::new());
             return;
         }
 
@@ -1136,10 +1235,7 @@ impl<'a> HtmlParser<'a> {
         if !terminated {
             return;
         }
-
-        let parent = self.current_parent();
-        let comment_id = self.doc.create_node(NodeKind::Comment { content });
-        self.doc.append_child(parent, comment_id);
+        self.append_comment(content);
     }
 
     // --- Processing Instructions ---
@@ -1167,6 +1263,10 @@ impl<'a> HtmlParser<'a> {
         }
 
         let pi_data = if data.is_empty() { None } else { Some(data) };
+        self.emit(Event::ProcessingInstruction {
+            target: &target,
+            data: pi_data.as_deref(),
+        });
 
         let parent = self.current_parent();
         let pi_id = self.doc.create_node(NodeKind::ProcessingInstruction {

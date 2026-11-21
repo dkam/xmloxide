@@ -19,6 +19,7 @@ pub use push::PushParser;
 use std::sync::Arc;
 
 use crate::error::ParseError;
+use crate::events::EventHandler;
 use crate::tree::Document;
 
 use input::{
@@ -294,4 +295,25 @@ pub fn parse_str(input: &str) -> Result<Document, ParseError> {
 pub fn parse_str_with_options(input: &str, options: &ParseOptions) -> Result<Document, ParseError> {
     let mut parser = xml::XmlParser::new(input, options);
     parser.parse()
+}
+
+/// Parses an XML string, reporting each event to `handler` as it occurs
+/// (see [`crate::events`]). A fatal error is reported too, and the end of
+/// the document always is.
+pub(crate) fn parse_str_reporting(
+    input: &str,
+    options: &ParseOptions,
+    handler: &mut dyn EventHandler,
+) -> Result<Document, ParseError> {
+    let mut parser = xml::XmlParser::new(input, options);
+    parser.events = Some(handler);
+    let result = parser.parse();
+    if result.is_err() {
+        parser.report_diagnostics();
+    }
+    let location = parser.location();
+    if let Some(handler) = parser.events {
+        crate::events::report_end(handler, result.as_ref().err(), location);
+    }
+    result
 }
