@@ -5,6 +5,7 @@
 use xmloxide::parser::{ParseOptions, PushParser};
 use xmloxide::reader::XmlReader;
 use xmloxide::sax::{parse_sax, SaxHandler};
+use xmloxide::tree::NodeKind;
 
 /// Helper: builds `ParseOptions` with an entity resolver that maps
 /// known SYSTEM ids to replacement text.
@@ -232,4 +233,54 @@ fn test_parse_options_debug_with_resolver() {
     let opts = opts_with_resolver();
     let debug = format!("{opts:?}");
     assert!(debug.contains("entity_resolver"));
+}
+
+/// The messages of `doc`'s diagnostics.
+fn messages(doc: &xmloxide::Document) -> Vec<String> {
+    doc.diagnostics.iter().map(|d| d.message.clone()).collect()
+}
+
+/// Asserts that the root element's only child is a reference to `name`,
+/// not loaded: no replacement text, and no children.
+fn assert_unloaded_reference(doc: &xmloxide::Document, name: &str) {
+    let root = doc.root_element().unwrap();
+    let reference = doc.first_child(root).unwrap();
+    match &doc.node(reference).kind {
+        NodeKind::EntityRef { name: n, value } => {
+            assert_eq!(n, name);
+            assert_eq!(*value, None);
+        }
+        other => panic!("not an entity reference: {other:?}"),
+    }
+    assert!(doc.first_child(reference).is_none());
+}
+
+const EXTERNAL: &str = r#"<!DOCTYPE doc [
+<!ENTITY ext SYSTEM "unknown.ent">
+]>
+<doc>&ext;</doc>"#;
+
+#[test]
+fn test_keep_unloaded_entities_without_a_resolver() {
+    // As libxml2 does without XML_PARSE_NOENT: nothing is loaded, the
+    // reference is kept, and that is no error.
+    let opts = ParseOptions::default().keep_unloaded_entities(true);
+    let doc = xmloxide::parser::parse_str_with_options(EXTERNAL, &opts).unwrap();
+    assert_eq!(messages(&doc), Vec::<String>::new());
+    assert_unloaded_reference(&doc, "ext");
+}
+
+#[test]
+fn test_keep_unloaded_entities_the_resolver_cannot_load() {
+    // As libxml2 does when it can't load an entity: a warning, and the
+    // reference is kept, unloaded.
+    for recover in [false, true] {
+        let opts = ParseOptions::default()
+            .recover(recover)
+            .keep_unloaded_entities(true)
+            .entity_resolver(|_req| None);
+        let doc = xmloxide::parser::parse_str_with_options(EXTERNAL, &opts).unwrap();
+        assert_eq!(messages(&doc), [r#"failed to load "unknown.ent""#]);
+        assert_unloaded_reference(&doc, "ext");
+    }
 }

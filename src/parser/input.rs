@@ -1901,9 +1901,18 @@ pub(crate) fn parse_pi_content(
     input.expect_str(b"<?")?;
     let target = input.parse_name()?;
 
-    // "xml" (case-insensitive) is reserved for the XML declaration
+    // "xml" (case-insensitive) is reserved for the XML declaration.
+    // Recovering, libxml2 reports it and keeps the PI.
     if target.eq_ignore_ascii_case("xml") {
-        return Err(input.fatal("PI target 'xml' is reserved"));
+        if !input.recover() {
+            return Err(input.fatal("PI target 'xml' is reserved"));
+        }
+        let message = if target == "xml" {
+            "XML declaration allowed only at the start of the document"
+        } else {
+            "Invalid PI name"
+        };
+        input.push_diagnostic(ErrorSeverity::Error, message.to_owned());
     }
 
     // Namespaces in XML 1.0 §3: PI targets must be NCNames (no colons).

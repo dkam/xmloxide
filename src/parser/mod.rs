@@ -66,6 +66,7 @@ pub type EntityResolver = Arc<dyn Fn(ExternalEntityRequest<'_>) -> Option<String
 ///     .no_blanks(true)
 ///     .max_depth(128);
 /// ```
+#[allow(clippy::struct_excessive_bools)] // independent options, as in HtmlParseOptions
 pub struct ParseOptions {
     /// If true, attempt to recover from errors and produce a partial tree.
     pub recover: bool,
@@ -76,6 +77,11 @@ pub struct ParseOptions {
     ///
     /// See [`ParseOptions::dtd_attributes`] for details.
     pub dtd_attributes: bool,
+    /// If true, a reference to an external entity that isn't loaded is
+    /// kept, as libxml2 keeps it, rather than being an error.
+    ///
+    /// See [`ParseOptions::keep_unloaded_entities`] for details.
+    pub keep_unloaded_entities: bool,
 
     // -- Security limits --
     /// Maximum element nesting depth (default: 256).
@@ -104,6 +110,7 @@ impl Clone for ParseOptions {
             recover: self.recover,
             no_blanks: self.no_blanks,
             dtd_attributes: self.dtd_attributes,
+            keep_unloaded_entities: self.keep_unloaded_entities,
             max_depth: self.max_depth,
             max_attributes: self.max_attributes,
             max_attribute_length: self.max_attribute_length,
@@ -121,6 +128,7 @@ impl std::fmt::Debug for ParseOptions {
             .field("recover", &self.recover)
             .field("no_blanks", &self.no_blanks)
             .field("dtd_attributes", &self.dtd_attributes)
+            .field("keep_unloaded_entities", &self.keep_unloaded_entities)
             .field("max_depth", &self.max_depth)
             .field("max_attributes", &self.max_attributes)
             .field("max_attribute_length", &self.max_attribute_length)
@@ -141,6 +149,7 @@ impl Default for ParseOptions {
             recover: false,
             no_blanks: false,
             dtd_attributes: true,
+            keep_unloaded_entities: false,
             max_depth: DEFAULT_MAX_DEPTH,
             max_attributes: DEFAULT_MAX_ATTRIBUTES,
             max_attribute_length: DEFAULT_MAX_ATTRIBUTE_LENGTH,
@@ -210,6 +219,31 @@ impl ParseOptions {
     #[must_use]
     pub fn dtd_attributes(mut self, yes: bool) -> Self {
         self.dtd_attributes = yes;
+        self
+    }
+
+    /// Keeps a reference to an external entity in element content that
+    /// isn't loaded, as libxml2 does, rather than failing. An external
+    /// entity is loaded only by the [`entity_resolver`](Self::entity_resolver),
+    /// as libxml2 loads one only with `XML_PARSE_NOENT`: without one, the
+    /// reference is kept without its text and without a diagnostic, and
+    /// one the resolver can't load is kept with a warning.
+    ///
+    /// Off by default: such a reference is an error, so that a document
+    /// can't quietly lose an entity's text.
+    ///
+    /// ```
+    /// use xmloxide::parser::{parse_str_with_options, ParseOptions};
+    ///
+    /// let xml = r#"<!DOCTYPE r [<!ENTITY e SYSTEM "e.ent">]><r>&e;</r>"#;
+    /// assert!(parse_str_with_options(xml, &ParseOptions::default()).is_err());
+    /// let opts = ParseOptions::default().keep_unloaded_entities(true);
+    /// let doc = parse_str_with_options(xml, &opts).unwrap();
+    /// assert!(doc.diagnostics.is_empty());
+    /// ```
+    #[must_use]
+    pub fn keep_unloaded_entities(mut self, yes: bool) -> Self {
+        self.keep_unloaded_entities = yes;
         self
     }
 

@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::error::{ErrorSeverity, ParseError};
+use crate::error::{ErrorSeverity, ParseDiagnostic, ParseError};
 use crate::events::{Event, Reporter};
 use crate::tree::{Attribute, Document, NodeId, NodeKind};
 use crate::validation::dtd::{parse_dtd, serialize_dtd, AttributeDecl, AttributeType, EntityKind};
@@ -57,6 +57,9 @@ pub(crate) struct XmlParser<'a, 'h> {
     entity_depth: u32,
     /// Where to report parse events, if anywhere.
     pub(crate) reporter: Reporter<'h>,
+    /// Whether the input has ended inside an element, which recovering
+    /// closes (and the elements around it).
+    ended: bool,
 }
 
 impl<'a> XmlParser<'a, '_> {
@@ -81,6 +84,7 @@ impl<'a> XmlParser<'a, '_> {
             expansion_size: 0,
             entity_depth: 0,
             reporter: Reporter::new(None),
+            ended: false,
         }
     }
 
@@ -177,11 +181,19 @@ impl<'a> XmlParser<'a, '_> {
                 .is_some_and(|b| b != b'!' && b != b'?')
         {
             self.parse_element(self.doc.root())?;
-        } else if self.options.recover {
-            self.input
-                .push_diagnostic(ErrorSeverity::Error, "missing root element".to_string());
         } else {
-            return Err(self.input.fatal("missing root element"));
+            // libxml2's XML_ERR_DOCUMENT_EMPTY when there is no input at all.
+            let message = if self.input_size == 0 {
+                "Document is empty"
+            } else {
+                "missing root element"
+            };
+            if self.options.recover {
+                self.input
+                    .push_diagnostic(ErrorSeverity::Error, message.to_string());
+            } else {
+                return Err(self.input.fatal(message));
+            }
         }
 
         // Parse trailing content (comments, PIs after root element)
@@ -438,6 +450,7 @@ impl<'a> XmlParser<'a, '_> {
 
     #[allow(clippy::too_many_lines)]
     fn parse_element(&mut self, parent: NodeId) -> Result<NodeId, ParseError> {
+        let start_line = self.input.location().line;
         self.input.increment_depth()?;
         self.input.expect_byte(b'<')?;
         let name = self.input.parse_name()?;
@@ -753,6 +766,9 @@ impl<'a> XmlParser<'a, '_> {
                             ));
                         }
                     }
+                    if let Some((severity, message)) = default_namespace_problem(&ns_value) {
+                        self.input.push_diagnostic(severity, message);
+                    }
                     self.ns.bind(None, ns_value);
                 } else if attr.prefix.is_some() && attr.name.contains(':') {
                     // Validate QName syntax for prefixed non-namespace attributes.
@@ -917,6 +933,30 @@ impl<'a> XmlParser<'a, '_> {
         // Parse element content
         self.parse_content(elem_id)?;
 
+        // Recovering, an element the input ends inside is closed, as libxml2
+        // closes it: the innermost one is reported, unless there was an
+        // error before.
+        if self.options.recover && self.input.at_end() {
+            if !self.ended {
+                self.ended = true;
+                let well_formed = self
+                    .input
+                    .diagnostics
+                    .iter()
+                    .all(|d| d.severity == ErrorSeverity::Warning);
+                if well_formed {
+                    let name = self.doc.node_name(elem_id).unwrap_or_default();
+                    let message = format!("Premature end of data in tag {name} line {start_line}");
+                    self.input.push_diagnostic(ErrorSeverity::Error, message);
+                }
+            }
+            if has_ns_decls {
+                self.ns.pop_scope();
+            }
+            self.input.decrement_depth();
+            return Ok(elem_id);
+        }
+
         // Parse end tag — read back the stored name from the tree node
         // for matching, since the original name was consumed by split_owned_name.
         self.input.expect_str(b"</")?;
@@ -1024,16 +1064,30 @@ impl<'a> XmlParser<'a, '_> {
                 break;
             }
 
-            if self.input.looking_at(b"<![CDATA[") {
-                self.parse_cdata(parent)?;
+            let parsed = if self.input.looking_at(b"<![CDATA[") {
+                self.parse_cdata(parent)
             } else if self.input.looking_at(b"<!--") {
-                self.parse_comment(parent)?;
+                self.parse_comment(parent)
             } else if self.input.looking_at(b"<?") {
-                self.parse_processing_instruction(parent)?;
+                self.parse_processing_instruction(parent)
             } else if self.input.peek() == Some(b'<') {
-                self.parse_element(parent)?;
+                self.parse_element(parent).map(drop)
             } else {
-                self.parse_char_data(parent)?;
+                self.parse_char_data(parent)
+            };
+            if let Err(error) = parsed {
+                // Recovering, a construct the input ends inside is dropped,
+                // and the elements around it closed, as libxml2 does.
+                if !(self.options.recover && self.input.at_end()) {
+                    return Err(error);
+                }
+                self.input.diagnostics.push(ParseDiagnostic {
+                    severity: ErrorSeverity::Error,
+                    message: error.message,
+                    location: error.location,
+                });
+                self.ended = true;
+                break;
             }
         }
         Ok(())
@@ -1175,25 +1229,31 @@ impl<'a> XmlParser<'a, '_> {
         let replacement: Option<String> = if let Some(raw) = self.input.entity_map.get(&name) {
             Some(crate::validation::dtd::expand_char_refs_only(raw))
         } else if let Some(info) = self.input.entity_external.get(&name).cloned() {
-            if let Some(resolver) = self.options.entity_resolver.clone() {
-                let request = crate::parser::ExternalEntityRequest {
+            let resolved = self.options.entity_resolver.clone().and_then(|resolver| {
+                resolver(crate::parser::ExternalEntityRequest {
                     name: &name,
                     system_id: &info.system_id,
                     public_id: info.public_id.as_deref(),
-                };
-                if let Some(resolved) = resolver(request) {
-                    // External parsed entities may begin with a text
-                    // declaration (XML 1.0 §4.3.1) which is not content.
-                    Some(strip_text_declaration(&resolved).to_string())
-                } else {
+                })
+            });
+            match resolved {
+                // External parsed entities may begin with a text declaration
+                // (XML 1.0 §4.3.1) which is not content.
+                Some(text) => Some(strip_text_declaration(&text).to_string()),
+                // Kept without its text, as libxml2 keeps one it doesn't
+                // load: with a warning if a resolver failed to load it.
+                None if self.options.keep_unloaded_entities => {
+                    if self.options.entity_resolver.is_some() {
+                        let message = format!("failed to load \"{}\"", info.system_id);
+                        self.input.push_diagnostic(ErrorSeverity::Warning, message);
+                    }
+                    None
+                }
+                None => {
                     return Err(self.input.fatal(format!(
                         "reference to external entity '{name}' is not supported"
                     )));
                 }
-            } else {
-                return Err(self.input.fatal(format!(
-                    "reference to external entity '{name}' is not supported"
-                )));
             }
         } else if self.input.has_pe_references || self.input.has_external_dtd {
             // Undeclared entity in tolerant mode (external DTD or PE refs
@@ -1564,6 +1624,33 @@ fn strip_text_declaration(s: &str) -> &str {
     s
 }
 
+/// What libxml2's `xmlParseStartTag2` finds wrong with a default namespace
+/// `uri`, if anything: an error for one that isn't a URI (here, one with
+/// a blank in it), and a warning for one without a scheme.
+fn default_namespace_problem(uri: &str) -> Option<(ErrorSeverity, String)> {
+    if uri.is_empty() {
+        return None;
+    }
+    if uri.contains(|c: char| c.is_ascii_whitespace()) {
+        return Some((
+            ErrorSeverity::Error,
+            format!("xmlns: '{uri}' is not a valid URI"),
+        ));
+    }
+    let has_scheme = uri.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    });
+    (!has_scheme).then(|| {
+        (
+            ErrorSeverity::Warning,
+            format!("xmlns: URI {uri} is not absolute"),
+        )
+    })
+}
+
 /// Returns true if the entity name is one of the five XML builtin entities.
 fn is_builtin_entity(name: &str) -> bool {
     matches!(name, "amp" | "lt" | "gt" | "apos" | "quot")
@@ -1790,6 +1877,113 @@ mod tests {
                 "{input}"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_str_reports_an_empty_document() {
+        // libxml2's XML_ERR_DOCUMENT_EMPTY: no input at all.
+        let error = crate::parser::parse_str("").unwrap_err();
+        assert_eq!(error.message, "Document is empty");
+        let error = crate::parser::parse_str(" ").unwrap_err();
+        assert_eq!(error.message, "missing root element");
+    }
+
+    #[test]
+    fn test_parse_str_warns_of_a_default_namespace_that_is_not_absolute() {
+        // As libxml2's xmlParseStartTag2 does; a prefixed declaration it
+        // doesn't check.
+        let diagnostics = |input: &str| {
+            let doc = crate::parser::parse_str(input).unwrap();
+            doc.diagnostics
+                .iter()
+                .map(|d| (d.severity, d.message.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            diagnostics("<doc xmlns='x'/>"),
+            [(
+                ErrorSeverity::Warning,
+                "xmlns: URI x is not absolute".to_owned()
+            )]
+        );
+        assert_eq!(
+            diagnostics("<doc xmlns='a b'/>"),
+            [(
+                ErrorSeverity::Error,
+                "xmlns: 'a b' is not a valid URI".to_owned()
+            )]
+        );
+        for input in [
+            "<doc xmlns='urn:x'/>",
+            "<doc xmlns='http://x/y'/>",
+            "<doc xmlns=''/>",
+            "<doc xmlns:a='x'/>",
+        ] {
+            assert_eq!(diagnostics(input), [], "{input}");
+        }
+    }
+
+    /// Parses `input` recovering, as XML written back out, and the
+    /// diagnostics' messages.
+    fn recovered(input: &str) -> (String, Vec<String>) {
+        let options = crate::parser::ParseOptions::default().recover(true);
+        let doc = crate::parser::parse_str_with_options(input, &options)
+            .unwrap_or_else(|e| panic!("{input}: {e}"));
+        let messages = doc.diagnostics.iter().map(|d| d.message.clone()).collect();
+        let root = doc.root_element().unwrap();
+        let options = crate::serial::SerializeOptions::default();
+        (
+            crate::serial::serialize_node(&doc, root, &options),
+            messages,
+        )
+    }
+
+    #[test]
+    fn test_parse_str_recovers_from_a_misplaced_xml_declaration() {
+        // As libxml2 does: the declaration is a PI, after an error.
+        let (xml, messages) = recovered("<r><a><?xml version='1.0'?><b>hey</b></a></r>");
+        assert_eq!(xml, "<r><a><?xml version='1.0'?><b>hey</b></a></r>");
+        assert_eq!(
+            messages,
+            ["XML declaration allowed only at the start of the document"]
+        );
+        let (xml, messages) = recovered("<r><?XML x?></r>");
+        assert_eq!(xml, "<r><?XML x?></r>");
+        assert_eq!(messages, ["Invalid PI name"]);
+    }
+
+    #[test]
+    fn test_parse_str_recovers_at_the_end_of_input() {
+        // As libxml2 does: what is open is closed, and the innermost
+        // element reported, unless there was an error before.
+        let cases: [(&str, &str, &[&str]); 4] = [
+            (
+                "<a><b>x</b>",
+                "<a><b>x</b></a>",
+                &["Premature end of data in tag a line 1"],
+            ),
+            (
+                "<a>\n<b>",
+                "<a>\n<b/></a>",
+                &["Premature end of data in tag b line 2"],
+            ),
+            (
+                "<a><b></x>",
+                "<a><b/></a>",
+                &["mismatched end tag: expected </b>, found </x>"],
+            ),
+            (
+                "<a>t<!-- c",
+                "<a>t</a>",
+                &["unexpected end of input in comment"],
+            ),
+        ];
+        for (input, expected, expected_messages) in cases {
+            let (xml, messages) = recovered(input);
+            assert_eq!(xml, expected, "{input}");
+            assert_eq!(messages, expected_messages, "{input}");
+        }
+        assert!(crate::parser::parse_str("<a>").is_err());
     }
 
     #[test]
