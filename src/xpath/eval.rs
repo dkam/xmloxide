@@ -305,6 +305,27 @@ impl<'a> XPathContext<'a> {
         self.eval_expr(expr)
     }
 
+    /// Returns whether the nodes from `start` on in `nodes` continue the
+    /// document order of the nodes before `start`.
+    ///
+    /// Both runs must already be in document order on their own, so only the
+    /// join between them needs checking: one comparison per input node of a
+    /// step, instead of one per result node.
+    fn continues_document_order(&self, nodes: &[XPathNode], start: usize) -> bool {
+        if start == 0 || start == nodes.len() {
+            return true;
+        }
+        let (before, after) = (nodes[start - 1], nodes[start]);
+        if self.doc.ids_in_document_order() {
+            return before < after;
+        }
+        let key = |node: XPathNode| {
+            let (anchor, is_attribute, index) = node.sort_key();
+            (self.doc.document_order_key(anchor), is_attribute, index)
+        };
+        key(before) < key(after)
+    }
+
     /// Sorts nodes into document order; attribute nodes sort just after
     /// their owner element, by attribute index. Ids are document order until
     /// the tree has been rearranged; then the document supplies positions.
@@ -577,6 +598,10 @@ impl<'a> XPathContext<'a> {
     fn apply_step(&self, input: &[XPathNode], step: &Step) -> Result<Vec<XPathNode>, XPathError> {
         self.check_step_prefix(step)?;
         let mut result: Vec<XPathNode> = Vec::new();
+        // Whether the results of each input node continued the document
+        // order of those before them, where `joins_can_break_order` says
+        // they might not have.
+        let mut joins_in_order = true;
 
         if step.predicates.is_empty() {
             if input.len() == 1 {
@@ -585,7 +610,9 @@ impl<'a> XPathContext<'a> {
             } else {
                 // Multiple input nodes — need dedup via HashSet.
                 let mut seen = HashSet::new();
+                let check_joins = joins_can_break_order(step.axis, false);
                 for &node in input {
+                    let start = result.len();
                     self.expand_axis_filtered_dedup(
                         node,
                         step.axis,
@@ -593,6 +620,9 @@ impl<'a> XPathContext<'a> {
                         &mut result,
                         &mut seen,
                     );
+                    if check_joins {
+                        joins_in_order &= self.continues_document_order(&result, start);
+                    }
                 }
             }
         } else {
@@ -602,6 +632,7 @@ impl<'a> XPathContext<'a> {
             // first b of every a. The per-context results are then merged
             // with duplicates removed.
             let mut seen: HashSet<XPathNode> = HashSet::new();
+            let check_joins = input.len() > 1 && joins_can_break_order(step.axis, true);
             for &node in input {
                 let mut per_node = Vec::new();
                 self.expand_axis_filtered(node, step.axis, &step.node_test, &mut per_node);
@@ -612,19 +643,24 @@ impl<'a> XPathContext<'a> {
                     result = per_node;
                     break;
                 }
+                let start = result.len();
                 for n in per_node {
                     if seen.insert(n) {
                         result.push(n);
                     }
+                }
+                if check_joins {
+                    joins_in_order &= self.continues_document_order(&result, start);
                 }
             }
         }
 
         // Sort into document order. Skip for axes that naturally produce
         // document-order results when input is already ordered (the common
-        // case) — unless the input mixes in attribute entries, whose axis
-        // expansions (e.g. descendant-or-self, following) do not concatenate
-        // in document order with their owner's.
+        // case), if those results also joined up in order — unless the
+        // input mixes in attribute entries, whose axis expansions (e.g.
+        // descendant-or-self, following) do not concatenate in document
+        // order with their owner's.
         let needs_sort = !matches!(
             step.axis,
             Axis::Child
@@ -635,7 +671,7 @@ impl<'a> XPathContext<'a> {
                 | Axis::FollowingSibling
         );
         let attribute_input = input.len() > 1 && input.iter().any(|n| n.is_attribute());
-        if needs_sort || attribute_input {
+        if needs_sort || !joins_in_order || attribute_input {
             self.sort_document_order(&mut result);
         }
 
@@ -2317,6 +2353,26 @@ impl<'a> XPathContext<'a> {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// Returns whether joining several input nodes' results on `axis`, each
+/// in document order, can fail to give document order.
+///
+/// The input nodes are in document order. On the child and following axes
+/// the join breaks when one input node is inside another (`//*/*`); on
+/// following-sibling, also when one is inside a following sibling of
+/// another (`(a | b/c)/following-sibling::*`). On the descendant axes a
+/// later input node is either inside an earlier one, so its results are all
+/// duplicates, or after all of its descendants; only predicates, which keep
+/// different nodes for each input node, can break the order there. The
+/// self axis gives each input node at most itself. The other axes are
+/// sorted anyway.
+fn joins_can_break_order(axis: Axis, has_predicates: bool) -> bool {
+    match axis {
+        Axis::Child | Axis::Following | Axis::FollowingSibling => true,
+        Axis::Descendant | Axis::DescendantOrSelf => has_predicates,
+        _ => false,
+    }
+}
+
 /// Rounds a number using `XPath` rounding rules: round half toward positive
 /// infinity.
 ///
@@ -2688,6 +2744,76 @@ mod tests {
         assert_eq!(eval_count(xml2, "//a/@*[1]"), 2);
         assert_eq!(eval_count(xml2, "//a/@*[last()]"), 2);
         assert_eq!(eval_xpath(xml2, "sum(//a/@*[1])"), XPathValue::Number(4.0));
+    }
+
+    /// Helper: the names of the elements an `XPath` expression selects, in
+    /// the order it returns them, joined by spaces.
+    fn element_names(xml: &str, xpath: &str) -> String {
+        element_names_in(&Document::parse_str(xml).unwrap(), xpath)
+    }
+
+    /// Helper: as `element_names`, over an already-built document.
+    fn element_names_in(doc: &Document, xpath: &str) -> String {
+        let XPathValue::NodeSet(ns) = XPathContext::new(doc, doc.root())
+            .evaluate(&parse(xpath).unwrap())
+            .unwrap()
+        else {
+            panic!("expected node-set for {xpath}");
+        };
+        ns.iter()
+            .map(|n| {
+                let id = n.as_tree_node().unwrap();
+                doc.node_name(id).unwrap().to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn test_multi_input_step_document_order() {
+        // Each input node's results are in document order, but joining
+        // them is not when one input node sits inside another (`a` inside
+        // `r`), or inside a following sibling of another (`c` in `b`).
+        // Expected orders checked against libxml2.
+        let nested = "<r><a><b/><d/></a><c/></r>";
+        for (xpath, expected) in [
+            ("//*/*", "a b d c"),
+            ("//*/following-sibling::*", "d c"),
+            ("//*/following::*", "d c"),
+            ("//*/descendant::*", "a b d c"),
+            ("//*/descendant-or-self::*", "r a b d c"),
+        ] {
+            assert_eq!(element_names(nested, xpath), expected, "{xpath}");
+        }
+        let sibling = "<r><a/><b><c/><d/></b><e/></r>";
+        for (xpath, expected) in [
+            ("(/r/a | //c)/following-sibling::*", "b d e"),
+            ("(/r/a | //c)/following::*", "b c d e"),
+        ] {
+            assert_eq!(element_names(sibling, xpath), expected, "{xpath}");
+        }
+    }
+
+    #[test]
+    fn test_multi_input_step_with_predicates_document_order() {
+        // A step with predicates filters each input node's results on
+        // their own (XPath 1.0 §2.4); the merged results must still come
+        // out in document order. Expected orders checked against libxml2.
+        let nested = "<r><a><b/><d/></a><c/></r>";
+        for (xpath, expected) in [
+            ("//*/*[last()]", "d c"),
+            ("//*/following-sibling::*[1]", "d c"),
+            ("//*/following::*[1]", "d c"),
+            ("//*/descendant::*[last()]", "d c"),
+            ("//*/descendant-or-self::*[last()]", "b d c"),
+        ] {
+            assert_eq!(element_names(nested, xpath), expected, "{xpath}");
+        }
+        let sibling = "<r><a/><b><c/><d/></b><e/></r>";
+        assert_eq!(
+            element_names(sibling, "(/r/a | //c)/following-sibling::*[last()]"),
+            "d e"
+        );
     }
 
     #[test]
@@ -3696,5 +3822,22 @@ mod tests {
         let last_b = doc.last_child(r).unwrap();
         assert_eq!(names("//a | //b"), [first, a, last_b]);
         assert_eq!(names("/r/*[2]"), [a]);
+    }
+
+    #[test]
+    fn test_multi_input_step_document_order_after_insertion() {
+        // After an insertion ids no longer follow document order, so the
+        // check where input nodes' results join must not compare raw ids.
+        let mut doc = Document::parse_str("<r><x/><y/></r>").unwrap();
+        let x = doc.first_child(doc.root_element().unwrap()).unwrap();
+        let p = doc.create_element("p");
+        doc.append_child(x, p);
+        // Document order is r, x, p, y, but p has the highest id.
+        assert_eq!(
+            element_names_in(&doc, "//*/*"),
+            "x p y",
+            "children of r and of x"
+        );
+        assert_eq!(element_names_in(&doc, "//*/*[last()]"), "p y");
     }
 }
