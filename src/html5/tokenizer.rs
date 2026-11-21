@@ -2161,7 +2161,9 @@ impl<'a> Tokenizer<'a> {
                     self.pos += 6;
                     self.state = State::AfterDoctypeSystemKeyword;
                 } else {
-                    self.consume(); // re-consume the char we put back
+                    // Reported at the character, which the bogus DOCTYPE
+                    // state then reconsumes.
+                    self.char_start = self.pos;
                     self.emit_error("invalid-character-sequence-after-doctype-name");
                     self.current_doctype_force_quirks = true;
                     self.state = State::BogusDoctype;
@@ -2198,9 +2200,10 @@ impl<'a> Tokenizer<'a> {
                 self.emit_doctype();
                 self.emit_eof();
             }
-            Some(_) => {
+            Some(c) => {
                 self.emit_error("missing-quote-before-doctype-public-identifier");
                 self.current_doctype_force_quirks = true;
+                self.reconsume(c);
                 self.state = State::BogusDoctype;
             }
         }
@@ -2232,9 +2235,10 @@ impl<'a> Tokenizer<'a> {
                 self.emit_doctype();
                 self.emit_eof();
             }
-            Some(_) => {
+            Some(c) => {
                 self.emit_error("missing-quote-before-doctype-public-identifier");
                 self.current_doctype_force_quirks = true;
+                self.reconsume(c);
                 self.state = State::BogusDoctype;
             }
         }
@@ -2330,9 +2334,10 @@ impl<'a> Tokenizer<'a> {
                 self.emit_doctype();
                 self.emit_eof();
             }
-            Some(_) => {
+            Some(c) => {
                 self.emit_error("missing-quote-before-doctype-system-identifier");
                 self.current_doctype_force_quirks = true;
+                self.reconsume(c);
                 self.state = State::BogusDoctype;
             }
         }
@@ -2362,9 +2367,10 @@ impl<'a> Tokenizer<'a> {
                 self.emit_doctype();
                 self.emit_eof();
             }
-            Some(_) => {
+            Some(c) => {
                 self.emit_error("missing-quote-before-doctype-system-identifier");
                 self.current_doctype_force_quirks = true;
+                self.reconsume(c);
                 self.state = State::BogusDoctype;
             }
         }
@@ -2398,9 +2404,10 @@ impl<'a> Tokenizer<'a> {
                 self.emit_doctype();
                 self.emit_eof();
             }
-            Some(_) => {
+            Some(c) => {
                 self.emit_error("missing-quote-before-doctype-system-identifier");
                 self.current_doctype_force_quirks = true;
+                self.reconsume(c);
                 self.state = State::BogusDoctype;
             }
         }
@@ -2432,9 +2439,10 @@ impl<'a> Tokenizer<'a> {
                 self.emit_doctype();
                 self.emit_eof();
             }
-            Some(_) => {
+            Some(c) => {
                 self.emit_error("missing-quote-before-doctype-system-identifier");
                 self.current_doctype_force_quirks = true;
+                self.reconsume(c);
                 self.state = State::BogusDoctype;
             }
         }
@@ -2520,9 +2528,10 @@ impl<'a> Tokenizer<'a> {
                 self.emit_doctype();
                 self.emit_eof();
             }
-            Some(_) => {
+            Some(c) => {
                 self.emit_error("unexpected-character-after-doctype-system-identifier");
                 // Do NOT set force-quirks.
+                self.reconsume(c);
                 self.state = State::BogusDoctype;
             }
         }
@@ -3048,6 +3057,50 @@ mod tests {
             starts.push(tok.token_start());
         }
         assert_eq!(starts, vec![0, 1, 4, 5]);
+    }
+
+    #[test]
+    fn test_bogus_doctype_reconsumes_the_unexpected_character() {
+        // Each state that gives up on a DOCTYPE reconsumes the character in
+        // the bogus DOCTYPE state (WHATWG 13.2.5.56 onwards), which reports
+        // a NULL itself.
+        let null = "unexpected-null-character";
+        for (input, first) in [
+            (
+                "<!DOCTYPE html \0>",
+                "invalid-character-sequence-after-doctype-name",
+            ),
+            (
+                "<!DOCTYPE html PUBLIC\0>",
+                "missing-quote-before-doctype-public-identifier",
+            ),
+            (
+                "<!DOCTYPE html PUBLIC \0>",
+                "missing-quote-before-doctype-public-identifier",
+            ),
+            (
+                "<!DOCTYPE html PUBLIC 'p'\0>",
+                "missing-quote-before-doctype-system-identifier",
+            ),
+            (
+                "<!DOCTYPE html PUBLIC 'p' \0>",
+                "missing-quote-before-doctype-system-identifier",
+            ),
+            (
+                "<!DOCTYPE html SYSTEM\0>",
+                "missing-quote-before-doctype-system-identifier",
+            ),
+            (
+                "<!DOCTYPE html SYSTEM \0>",
+                "missing-quote-before-doctype-system-identifier",
+            ),
+            (
+                "<!DOCTYPE html SYSTEM 's' \0>",
+                "unexpected-character-after-doctype-system-identifier",
+            ),
+        ] {
+            assert_eq!(tokenize_errors(input), vec![first, null], "{input:?}");
+        }
     }
 
     /// Helper: collect just the errors.
