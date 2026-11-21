@@ -199,6 +199,14 @@ pub struct Tokenizer<'a> {
     // Whether the adjusted current node is in a foreign (non-HTML) namespace.
     // Set by the tree builder; controls CDATA section handling.
     allow_cdata: bool,
+    // Where the tokens in `pending_tokens` began: the input position when the
+    // tokenizer started producing them. Tokens produced together share it.
+    pending_start: usize,
+    // Where the token `next_token` last returned began.
+    token_start: usize,
+    // Where the character most recently consumed began (the input's length
+    // after reaching its end), which errors report.
+    char_start: usize,
 }
 
 impl<'a> Tokenizer<'a> {
@@ -234,7 +242,22 @@ impl<'a> Tokenizer<'a> {
             last_start_tag_name: None,
             char_ref_code: 0,
             allow_cdata: false,
+            pending_start: 0,
+            token_start: 0,
+            char_start: 0,
         }
+    }
+
+    /// The input as the tokenizer reads it: with CR and CRLF normalized to
+    /// LF. Error spans and token starts are byte offsets into this.
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+
+    /// The byte offset (into [`Tokenizer::input`]) at which the token most
+    /// recently returned by [`Tokenizer::next_token`] began.
+    pub fn token_start(&self) -> usize {
+        self.token_start
     }
 
     /// Returns a reference to the errors collected so far.
@@ -286,10 +309,13 @@ impl<'a> Tokenizer<'a> {
     pub fn next_token(&mut self) -> Token {
         // Drain pending queue first (character reference expansions, etc.)
         if let Some(tok) = self.pending_tokens.pop_front() {
+            self.token_start = self.pending_start;
             return tok;
         }
+        self.pending_start = self.pos;
         loop {
             if let Some(tok) = self.pending_tokens.pop_front() {
+                self.token_start = self.pending_start;
                 return tok;
             }
             match self.state {
@@ -458,6 +484,9 @@ impl<'a> Tokenizer<'a> {
 
     /// Consume and return the next character, advancing `pos`.
     fn consume(&mut self) -> Option<char> {
+        // Errors are reported at the character being consumed, or at the end
+        // of the input.
+        self.char_start = self.pos;
         let ch = self.input[self.pos..].chars().next()?;
         self.pos += ch.len_utf8();
         Some(ch)
@@ -478,11 +507,11 @@ impl<'a> Tokenizer<'a> {
         remaining[self.pos..self.pos + needle.len()].eq_ignore_ascii_case(needle.as_bytes())
     }
 
-    /// Push a parse error.
+    /// Push a parse error, at the character the tokenizer is looking at.
     fn emit_error(&mut self, code: &'static str) {
         self.errors.push(TokenizerError {
             code,
-            span: self.pos,
+            span: self.char_start,
         });
     }
 
@@ -2646,6 +2675,8 @@ impl<'a> Tokenizer<'a> {
                         }
                     }
                 }
+                // Reported at the character after the reference.
+                self.char_start = self.pos;
                 self.emit_error("missing-semicolon-after-character-reference");
             }
 
@@ -2982,6 +3013,41 @@ mod tests {
             .into_iter()
             .filter(|t| *t != Token::Eof)
             .collect()
+    }
+
+    /// Helper: the errors, with their byte offsets.
+    fn error_spans(input: &str) -> Vec<(&'static str, usize)> {
+        let mut tok = Tokenizer::new(input);
+        while tok.next_token() != Token::Eof {}
+        tok.errors().iter().map(|e| (e.code, e.span)).collect()
+    }
+
+    #[test]
+    fn test_errors_are_located_at_the_offending_character() {
+        // As html5lib-tests locate them: at the character that caused the
+        // error, or at the end of the input.
+        assert_eq!(error_spans("a\0b"), vec![("unexpected-null-character", 1)]);
+        assert_eq!(
+            error_spans("<a b='\0'>"),
+            vec![("unexpected-null-character", 6)]
+        );
+        assert_eq!(error_spans("<a"), vec![("eof-in-tag", 2)]);
+        assert_eq!(
+            error_spans("&ampx"),
+            vec![("missing-semicolon-after-character-reference", 4)]
+        );
+    }
+
+    #[test]
+    fn test_token_start() {
+        // Offsets are into the input with CRLF normalized to LF.
+        let mut tok = Tokenizer::new("a<b>\r\n<!--c-->");
+        assert_eq!(tok.input(), "a<b>\n<!--c-->");
+        let mut starts = Vec::new();
+        while tok.next_token() != Token::Eof {
+            starts.push(tok.token_start());
+        }
+        assert_eq!(starts, vec![0, 1, 4, 5]);
     }
 
     /// Helper: collect just the errors.
