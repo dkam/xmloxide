@@ -315,6 +315,21 @@ impl<'a> XPathContext<'a> {
         }
     }
 
+    /// Sorts nodes into document order; attribute nodes sort just after
+    /// their owner element, by attribute index. Ids are document order until
+    /// the tree has been rearranged; then the document supplies positions.
+    fn sort_document_order(&self, nodes: &mut [XPathNode]) {
+        if self.doc.ids_in_document_order() {
+            nodes.sort_unstable();
+        } else {
+            // Look each position up once, not on every comparison.
+            nodes.sort_by_cached_key(|node| {
+                let (anchor, is_attribute, index) = node.sort_key();
+                (self.doc.document_order_key(anchor), is_attribute, index)
+            });
+        }
+    }
+
     fn eval_root_path(&self, steps: &[Step]) -> Result<XPathValue, XPathError> {
         self.eval_steps_from(vec![XPathNode::Node(self.doc.root())], steps)
     }
@@ -382,7 +397,7 @@ impl<'a> XPathContext<'a> {
         );
         let attribute_input = input.len() > 1 && input.iter().any(|n| n.is_attribute());
         if needs_sort || attribute_input {
-            sort_document_order(&mut result);
+            self.sort_document_order(&mut result);
         }
 
         Ok(result)
@@ -1087,7 +1102,7 @@ impl<'a> XPathContext<'a> {
                 lnodes.push(id);
             }
         }
-        sort_document_order(&mut lnodes);
+        self.sort_document_order(&mut lnodes);
 
         Ok(XPathValue::NodeSet(lnodes))
     }
@@ -1602,7 +1617,7 @@ impl<'a> XPathContext<'a> {
             }
         }
 
-        sort_document_order(&mut result);
+        self.sort_document_order(&mut result);
         Ok(XPathValue::NodeSet(result))
     }
 
@@ -2046,15 +2061,6 @@ impl<'a> XPathContext<'a> {
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
-
-/// Sorts a node-set into document order using the arena index as a proxy.
-///
-/// Since nodes are allocated in document order during parsing, the arena
-/// index (encoded in `NodeId`) directly reflects document order; attribute
-/// nodes sort just after their owner element, by attribute index.
-fn sort_document_order(nodes: &mut [XPathNode]) {
-    nodes.sort_unstable();
-}
 
 /// Rounds a number using `XPath` rounding rules: round half toward positive
 /// infinity.
@@ -3157,5 +3163,74 @@ mod tests {
             }
             other => panic!("expected node-set, got {other:?}"),
         }
+    }
+
+    /// Evaluates `xpath` from the document node and returns the string value
+    /// of each node selected.
+    fn string_values(doc: &Document, xpath: &str) -> Vec<String> {
+        let ctx = XPathContext::new(doc, doc.root());
+        let XPathValue::NodeSet(nodes) = ctx.evaluate(&parse(xpath).unwrap()).unwrap() else {
+            panic!("expected a node-set from {xpath}");
+        };
+        nodes
+            .into_iter()
+            .map(|node| ctx.string_value(node))
+            .collect()
+    }
+
+    #[test]
+    fn test_node_sets_follow_document_order_after_insert_before() {
+        // A new <c><x>1</x></c> goes in front of nodes parsed earlier, so its
+        // ids are higher than theirs but it comes first in document order.
+        let mut doc = Document::parse_str("<r><a><x>2</x></a><b><x>3</x></b></r>").unwrap();
+        let r = doc.root_element().unwrap();
+        let a = doc.first_child(r).unwrap();
+        let c = doc.create_element("c");
+        let x = doc.create_element("x");
+        let one = doc.create_text("1");
+        doc.append_child(x, one);
+        doc.append_child(c, x);
+        doc.insert_before(a, c);
+
+        assert_eq!(string_values(&doc, "//x"), ["1", "2", "3"]);
+        assert_eq!(string_values(&doc, "//x | //x"), ["1", "2", "3"]);
+        assert_eq!(string_values(&doc, "//x/.."), ["1", "2", "3"]);
+        assert_eq!(string_values(&doc, "(//x/..)[1]"), ["1"]);
+        assert_eq!(
+            string_values(&doc, "//x/ancestor::*"),
+            ["123", "1", "2", "3"]
+        );
+    }
+
+    #[test]
+    fn test_node_sets_follow_document_order_after_a_move() {
+        // Moving <b> in front of <a> allocates nothing: the ids stay as
+        // parsed, but the document order is now b, a.
+        let mut doc = Document::parse_str("<r><a><x>2</x></a><b><x>1</x></b></r>").unwrap();
+        let r = doc.root_element().unwrap();
+        let a = doc.first_child(r).unwrap();
+        let b = doc.last_child(r).unwrap();
+        doc.detach(b);
+        doc.insert_before(a, b);
+
+        assert_eq!(string_values(&doc, "//x | //x"), ["1", "2"]);
+        assert_eq!(string_values(&doc, "//x/.."), ["1", "2"]);
+        assert_eq!(string_values(&doc, "(//x/..)[last()]"), ["2"]);
+    }
+
+    #[test]
+    fn test_node_sets_follow_document_order_after_append_to_earlier_parent() {
+        // Appending to <a> after <b> was parsed puts the new node before <b>.
+        let mut doc = Document::parse_str("<r><a><x>1</x></a><b><x>3</x></b></r>").unwrap();
+        let r = doc.root_element().unwrap();
+        let a = doc.first_child(r).unwrap();
+        let x = doc.create_element("x");
+        let two = doc.create_text("2");
+        doc.append_child(x, two);
+        doc.append_child(a, x);
+
+        assert_eq!(string_values(&doc, "//x | //x"), ["1", "2", "3"]);
+        assert_eq!(string_values(&doc, "//x/parent::*/x"), ["1", "2", "3"]);
+        assert_eq!(string_values(&doc, "//x/preceding::x"), ["1", "2"]);
     }
 }
