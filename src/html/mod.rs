@@ -311,6 +311,9 @@ struct HtmlParser<'a> {
     open_elements: Vec<(NodeId, String)>,
     /// Set when a fatal error (e.g. depth limit) occurs; stops parsing.
     fatal_error: Option<ParseError>,
+    /// The `<head>` a start tag before the body opened, which stays even if
+    /// it ends up empty, as libxml2 keeps it.
+    head_from_tag: Option<NodeId>,
 }
 
 impl<'a> HtmlParser<'a> {
@@ -324,6 +327,7 @@ impl<'a> HtmlParser<'a> {
             options: options.clone(),
             open_elements: Vec::new(),
             fatal_error: None,
+            head_from_tag: None,
         }
     }
 
@@ -379,7 +383,8 @@ impl<'a> HtmlParser<'a> {
             self.doc.prepend_child(root, doctype_id);
         }
 
-        // Remove empty <head> elements (libxml2 doesn't output empty <head>)
+        // Remove empty <head> elements the parser implied (libxml2 doesn't
+        // imply one it has nothing to put in)
         self.remove_empty_heads();
 
         Ok(std::mem::take(&mut self.doc))
@@ -459,7 +464,8 @@ impl<'a> HtmlParser<'a> {
         head_id
     }
 
-    /// Removes empty `<head>` elements from the document tree.
+    /// Removes empty `<head>` elements from the document tree, except one
+    /// from a start tag (`head_from_tag`).
     fn remove_empty_heads(&mut self) {
         let root = self.doc.root();
         for html_id in self.doc.children(root).collect::<Vec<_>>() {
@@ -470,6 +476,7 @@ impl<'a> HtmlParser<'a> {
             for child_id in self.doc.children(html_id).collect::<Vec<_>>() {
                 if matches!(&self.doc.node(child_id).kind, NodeKind::Element { name, .. } if name == "head")
                     && self.doc.first_child(child_id).is_none()
+                    && self.head_from_tag != Some(child_id)
                 {
                     self.doc.remove_node(child_id);
                 }
@@ -641,6 +648,9 @@ impl<'a> HtmlParser<'a> {
             }
             if lower_tag == "head" {
                 let head_id = self.ensure_head();
+                if !self.html_has_child("body") {
+                    self.head_from_tag = Some(head_id);
+                }
                 self.merge_attributes(head_id, attributes);
                 // Push head to open_elements so child elements go inside it
                 if !self.open_elements.iter().any(|(_, t)| t == "head") {
@@ -1887,6 +1897,13 @@ mod tests {
     #[test]
     fn test_parse_script_after_body_not_moved_into_head() {
         let doc = parse("<html><head></head><body><p>a</p></body><script>x</script></html>");
-        assert_eq!(html_child_names(&doc), ["body", "script"]);
+        assert_eq!(html_child_names(&doc), ["head", "body", "script"]);
+    }
+
+    #[test]
+    fn test_empty_head_is_kept_only_from_a_start_tag_before_the_body() {
+        assert_eq!(html_child_names(&parse("<head></head><p>x")), ["head", "body"]);
+        assert_eq!(html_child_names(&parse("<p>x</p><head></head>")), ["body"]);
+        assert_eq!(html_child_names(&parse("<p>x")), ["body"]);
     }
 }
